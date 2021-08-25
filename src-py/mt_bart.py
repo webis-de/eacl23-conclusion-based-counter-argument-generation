@@ -191,7 +191,7 @@ class BartForMultiTaskArgGeneration(BartForConditionalGeneration):
 
 if __name__ == "__main__":
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
-    model = MultiTaskBart.from_pretrained('facebook/bart-base')
+    model = BartForMultiTaskArgGeneration.from_pretrained('facebook/bart-base')
     encoding = tokenizer("I love NLP")
     outputs = model(torch.tensor([encoding['input_ids']]), attention_mask=torch.tensor([encoding['attention_mask']]), return_dict=True)
     print(outputs.encoder_last_hidden_state)
