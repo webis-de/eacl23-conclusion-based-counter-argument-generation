@@ -306,6 +306,11 @@ def compute_metrics(eval_pred, tokenizer):
     # Extract a few results
     result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
     
+    #compute BertScore bertscore_metric
+    bertscore_result = bertscore_metric.compute(predictions=decoded_preds, references=decoded_labels, lang='en', rescale_with_baseline=True)
+    result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
+    
+    
     # Add mean generated length
     prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in predictions]
     result["gen_len"] = np.mean(prediction_lens)
