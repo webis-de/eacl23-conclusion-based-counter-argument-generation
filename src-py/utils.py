@@ -101,8 +101,8 @@ def postprocess_text(preds, labels):
         preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
         labels = ["\n".join(nltk.sent_tokenize(label)) for label in labels]
 
-        return preds, labels          
-
+        return preds, labels
+    
 def get_test_loader(dataset_path, tokenizer, args):
     
     test_ds = defaultdict(list)
@@ -140,6 +140,35 @@ def get_test_loader(dataset_path, tokenizer, args):
         test_loader  = DataLoader(test_ds, sampler=None, batch_size=args.batch_size, shuffle=False)
         
         return test_loader, raw_ds
+
+def generate_counters(model, tokenizer, data_loader, gen_kwargs):
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    
+    generated_attacks = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            generated_tokens = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs
+            )
+            
+            generated_tokens = generated_tokens.cpu().numpy()
+            
+            if isinstance(generated_tokens, tuple):
+                generated_tokens = generated_tokens[0]
+            
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            
+            generated_attacks += decoded_preds
+    
+    return generated_attacks
+
 
 def generate_and_evaluate_text(model, tokenizer, data_loader, args, gen_kwargs):
     metric = load_metric('rouge')
@@ -194,6 +223,34 @@ def generate_and_evaluate_text(model, tokenizer, data_loader, args, gen_kwargs):
         result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
     
     return result, generated_attacks, gt_attacks, detected_weak_premises
+
+def generate_counters(model, tokenizer, data_loader, gen_kwargs):
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    
+    generated_attacks = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            generated_tokens = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs
+            )
+            
+            generated_tokens = generated_tokens.cpu().numpy()
+            
+            if isinstance(generated_tokens, tuple):
+                generated_tokens = generated_tokens[0]
+            
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            
+            generated_attacks += decoded_preds
+    
+    return generated_attacks
 
 def evaluate_gen_attacks(generated_attacks, gt_attacks):
     metric = load_metric('rouge')
@@ -278,7 +335,7 @@ def preprocess_function(examples, tokenizer, input_clm, output_clm, max_input_le
     if isinstance(text_inputs[0], list):
         text_inputs = [' '.join(x) for x in text_inputs]
     
-    model_inputs = tokenizer(text_inputs, max_length=max_input_length, truncation=True)
+    model_inputs = tokenizer(text_inputs, max_length=max_input_length, truncation=True, padding='max_length')
     
     
     if isinstance(text_outputs[0], list):
@@ -286,7 +343,7 @@ def preprocess_function(examples, tokenizer, input_clm, output_clm, max_input_le
         
     # Setup the tokenizer for targets
     with tokenizer.as_target_tokenizer():
-        labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True)
+        labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True, padding='max_length')
 
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
