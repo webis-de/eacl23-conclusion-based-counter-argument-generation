@@ -26,6 +26,11 @@ max_target_length = 256
 tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
 model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
 
+#Add special tokens
+special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>']}
+num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+model.resize_token_embeddings(len(tokenizer))
+
 
 def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_batch_size=4, epochs=3):
 
@@ -58,7 +63,7 @@ def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_bat
     model.save_pretrained(output_dir)
 
 
-#CUDA_VISIABLE_DEVICES=0 python training_conclusion_and_ca_generation.py --train_data ../data/train_conclusion_comp_remove_50perc.pkl --valid_data ../data/valid_conclusion_comp_remove_50perc.pkl --output_dir ../data/output/known-conclusion-bart-model --downsample_valid=0.1 --train_bs=16 --valid_bs=16 --train_epochs=1
+#CUDA_VISIABLE_DEVICES=0 python training_conclusion_and_ca_generation.py --train_data ../data/train_conclusion_comp_remove_75sem_perc.pkl --valid_data ../data/valid_conclusion_comp_remove_75sem_perc.pkl --output_dir ../data/output/known-conclusion-bart-model --downsample_valid=0.1 --train_bs=16 --valid_bs=16 --train_epochs=3
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a argument gen task")
@@ -113,8 +118,8 @@ if __name__ == "__main__":
         valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter'), batched=True)
 
     else:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, 'premises_with_conclusion', 'counter'), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, 'premises_with_conclusion', 'counter'), batched=True)
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter', conclusion_clm='title'), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter', conclusion_clm='title'), batched=True)
 
 
     train_model(training_enc_ds, valid_enc_ds, args.output_dir, args.train_bs, args.valid_bs, args.train_epochs)
