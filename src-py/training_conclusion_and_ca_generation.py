@@ -27,7 +27,7 @@ tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
 model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
 
 #Add special tokens
-special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>']}
+special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
 num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 model.resize_token_embeddings(len(tokenizer))
 
@@ -61,7 +61,7 @@ def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_bat
     trainer.train()
 
     model.save_pretrained(output_dir)
-
+    tokenizer.save_pretrained(output_dir)
 
 #CUDA_VISIABLE_DEVICES=0 python training_conclusion_and_ca_generation.py --train_data ../data/train_conclusion_comp_remove_75sem_perc.pkl --valid_data ../data/valid_conclusion_comp_remove_75sem_perc.pkl --output_dir ../data/output/known-conclusion-bart-model --downsample_valid=0.1 --train_bs=16 --valid_bs=16 --train_epochs=3
 if __name__ == "__main__":
@@ -70,6 +70,10 @@ if __name__ == "__main__":
     
     parser.add_argument(
         '--masked_conclusion', action="store_true"
+    )
+    
+    parser.add_argument(
+        '--conclusion_and_counter_generation', action="store_true"
     )
     
     parser.add_argument(
@@ -87,10 +91,22 @@ if __name__ == "__main__":
     parser.add_argument(
         '--downsample_training', type=float, default=1
     )
-
+    
     parser.add_argument(
         '--downsample_valid', type=float, default=1
     )
+
+    parser.add_argument(
+        '--premises_clm', type=str, default='masked_premises'
+    )
+    parser.add_argument(
+        '--conclusion_clm', type=str, default='title'
+    )
+    parser.add_argument(
+        '--counter_clm', type=str, default='counter'
+    )
+    parser.add_argument('--max_source_length', type=int, default=512)
+    parser.add_argument('--max_target_length', type=int, default=256)
     parser.add_argument('--train_bs', type=int, default=2)
     parser.add_argument('--valid_bs', type=int, default=4)
     parser.add_argument('--train_epochs', type=int, default=3)
@@ -114,12 +130,15 @@ if __name__ == "__main__":
 
 
     if args.masked_conclusion:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter'), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter'), batched=True)
-
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        
+    elif args.conclusion_and_counter_generation:
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
     else:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter', conclusion_clm='title'), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, 'masked_premises', 'counter', conclusion_clm='title'), batched=True)
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
 
 
     train_model(training_enc_ds, valid_enc_ds, args.output_dir, args.train_bs, args.valid_bs, args.train_epochs)

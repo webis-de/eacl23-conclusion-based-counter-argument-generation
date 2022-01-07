@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 rouge_metric = load_metric("rouge")
 bertscore_metric = load_metric('bertscore')
 
-special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>']}
+special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, ds):
@@ -142,7 +142,7 @@ def get_test_loader(dataset_path, tokenizer, args):
         
         return test_loader, raw_ds
 
-def generate_counters(model, tokenizer, data_loader, gen_kwargs):
+def generate_counters(model, tokenizer, data_loader, gen_kwargs, skip_special_tokens=False):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     
     generated_attacks = []
@@ -164,7 +164,7 @@ def generate_counters(model, tokenizer, data_loader, gen_kwargs):
             if isinstance(generated_tokens, tuple):
                 generated_tokens = generated_tokens[0]
             
-            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=skip_special_tokens)
             
             generated_attacks += decoded_preds
     
@@ -229,18 +229,31 @@ def generate_and_evaluate_text(model, tokenizer, data_loader, args, gen_kwargs):
 def evaluate_gen_attacks(generated_attacks, gt_attacks):
     metric = load_metric('rouge')
     bertscore_metric = load_metric('bertscore')
-    
-    metric.add_batch(predictions=generated_attacks, references=gt_attacks)
-    bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)
-    
-    result = metric.compute(use_stemmer=True)
-    bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
+    bleu_score = load_metric('bleu')
+
+    #rouge doesn't accept a list of list so we will flatten
+#     if type(gt_attacks[0]) == list:
+#         flattend_list = [(item[0], gt) for item in zip(generated_attacks, gt_attacks) for gt in item[1]]
+#         gt_flatten_attacks, pred_flatten_attacks = zip(*flattend_list)
+#         metric.add_batch(predictions=pred_flatten_attacks, references=gt_flatten_attacks)
+#     else:
+#         metric.add_batch(predictions=generated_attacks, references=gt_attacks)
 
     # Extract a few results from ROUGE
-    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-    result = {k: round(v, 4) for k, v in result.items()}
-    result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
+#     result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+#     result = {k: round(v, 4) for k, v in result.items()}
+#     result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
+
+    bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)    
+    bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
+
+    gts = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
+    preds = [nltk.word_tokenize(x) for x in generated_attacks]
     
+    bleu_score.add_batch(predictions=preds, references=gts)    
+    result = bleu_score.compute()
+    
+    result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
     return result
             
 def eval_on_validation(model, tokenizer, valid_loader, args):
@@ -303,7 +316,7 @@ def eval_on_validation(model, tokenizer, valid_loader, args):
     return np.mean(avg_total_loss), np.mean(avg_lm_loss), np.mean(avg_wp_loss), result, decoded_preds
 
 #Encoding function for premises and conclusion experiments
-def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, max_input_length=512, max_target_length=200):
+def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, conclusion_in_output=False, max_input_length=512, max_target_length=200):
     premises   = examples[premises_clm]
     conclusions = examples[conclusion_clm] if conclusion_clm != None else None
     counters = examples[counter_clm]
@@ -312,24 +325,33 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
     if isinstance(premises[0], list):
         premises = [' '.join(x) for x in premises]
     
-    if conclusions == None:
+    if conclusions == None or conclusion_in_output== True: #if conclusion is passed and we don't want it in the toutput, then it should be added to the input for the known-conclusion model
         text_inputs = [ '<premises> ' + x + ' </premises>' for x in premises]
     else:
-        text_inputs = [ '<conclusion> ' + x[1] + '</conclusion>' + '<premises> ' + x[0] + ' </premises> ' for x in zip(premises, conclusions)]
+        text_inputs = [ '<conclusion> ' + x[1] + ' </conclusion> ' + ' <premises> ' + x[0] + ' </premises> ' for x in zip(premises, conclusions)]
             
     model_inputs = tokenizer(text_inputs, max_length=max_input_length, truncation=True, padding='max_length')
     
-    #print(text_inputs[0])
-    #print(model_inputs['input_ids'][0])
-    
     if isinstance(counters[0], list):
-        text_outputs = [' '.join(x) for x in counters]
-        
+        counters = [' '.join(x) for x in counters]
     
+    
+    if conclusion_in_output:
+        text_outputs = [ '<conclusion> ' + x[0] + ' <counter> ' + x[1]  for x in zip(conclusions, counters)]
+    else:
+        text_outputs = counters
+        
     # Setup the tokenizer for targets
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True, padding='max_length')
 
+#     print(text_inputs[0])
+#     print(model_inputs['input_ids'][0])
+#     print('-----------------')
+#     print(text_outputs[0])
+#     print(labels["input_ids"][0])
+    
+    
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
