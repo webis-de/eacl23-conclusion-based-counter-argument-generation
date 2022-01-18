@@ -10,23 +10,6 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 tokenizer = AutoTokenizer.from_pretrained("../../../data-ceph/arguana/arg-generation/conclusion-generation-models/dbart")
 model = AutoModelForSeq2SeqLM.from_pretrained("../../../data-ceph/arguana/arg-generation/conclusion-generation-models/dbart").to(device)
 
-def truncate_text(text, remove_extra_tokens=0):
-        for i in range(3):
-            tokens = tokenizer(
-                text, return_tensors="pt", truncation=True, padding=True
-            ).input_ids
-            max_model_length = tokens.size()[1]
-            truncated_tokens = tokens[0][: max_model_length - remove_extra_tokens]
-            text = tokenizer.decode(
-                truncated_tokens, clean_up_tokenization_spaces=True
-            )
-            without_truncate_length = tokenizer(
-                text, return_tensors="pt"
-            ).input_ids.size()[1]
-            if max_model_length > without_truncate_length:
-                return tokens, text
-        return truncate_text(text, remove_extra_tokens=remove_extra_tokens + 5)
-
 def generate_conclusion(premises, gen_kwargs, batch_size=16):
     if type(premises[0]) == list:
         premises = [' '.join(x) for x in premises]
