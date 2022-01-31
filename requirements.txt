@@ -1,0 +1,4 @@
+fastai==2.5.3
+spacy==2.2.1
+fast-pagerank
+sentence-transformers
