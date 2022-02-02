@@ -19,7 +19,7 @@ from transformers import BartTokenizer, BartForConditionalGeneration
 
 
 max_input_length = 512
-max_target_length = 256
+max_target_length = 200
 
 
 
@@ -36,15 +36,18 @@ def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_bat
 
     args = Seq2SeqTrainingArguments(
         output_dir,
-        evaluation_strategy = "epoch",
+        evaluation_strategy = "steps",
         learning_rate=2e-5,
         per_device_train_batch_size=training_batch_size,
         per_device_eval_batch_size=valid_batch_size,
         weight_decay=0.01,
-        save_total_limit=3,
+        save_total_limit=5,
         num_train_epochs=epochs,
+        load_best_model_at_end=True,
+        metric_for_best_model='bert-fscore',
         predict_with_generate=True
     )
+
 
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 
@@ -59,9 +62,7 @@ def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_bat
     )
 
     trainer.train()
-
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    trainer.save_model()
 
 #CUDA_VISIABLE_DEVICES=0 python training_conclusion_and_ca_generation.py --train_data ../data/train_conclusion_comp_remove_75sem_perc.pkl --valid_data ../data/valid_conclusion_comp_remove_75sem_perc.pkl --output_dir ../data/output/known-conclusion-bart-model --downsample_valid=0.1 --train_bs=16 --valid_bs=16 --train_epochs=3
 if __name__ == "__main__":
@@ -106,10 +107,10 @@ if __name__ == "__main__":
         '--counter_clm', type=str, default='counter'
     )
     parser.add_argument('--max_source_length', type=int, default=512)
-    parser.add_argument('--max_target_length', type=int, default=256)
-    parser.add_argument('--train_bs', type=int, default=2)
-    parser.add_argument('--valid_bs', type=int, default=4)
-    parser.add_argument('--train_epochs', type=int, default=3)
+    parser.add_argument('--max_target_length', type=int, default=200)
+    parser.add_argument('--train_bs', type=int, default=32)
+    parser.add_argument('--valid_bs', type=int, default=32)
+    parser.add_argument('--train_epochs', type=int, default=6)
     
     args = parser.parse_args()
 

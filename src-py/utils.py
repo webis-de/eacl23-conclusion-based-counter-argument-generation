@@ -55,7 +55,8 @@ def find_weak_premises_in_arg(argument, weak_premises):
             sen_indices.append(i)
     return sen_indices
 
-def process_instance(instance, tokenizer, max_source_length=512, max_target_length=200, ignore_pad_token_for_loss=True):
+#Code to prepare the instance for the multi-task learning for weak-premise and counter-generation
+def process_wp_instance(instance, tokenizer, max_source_length=512, max_target_length=200, ignore_pad_token_for_loss=True):
 
     processed_instance = {}
     
@@ -93,6 +94,66 @@ def process_instance(instance, tokenizer, max_source_length=512, max_target_leng
     #print(list(itertools.chain.from_iterable(argument_sentences_tokenized))[start_positions[0]:end_positions[0]])
     
     return processed_instance
+
+#Code to evaluate the weak premise multitask generation
+def eval_wp_on_validation(model, tokenizer, valid_loader, args):
+    
+    metric = load_metric('rouge')
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    
+    avg_total_loss = []
+    avg_lm_loss = []
+    avg_wp_loss = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in valid_loader:
+            input_ids = batch['input_ids'].to(device)
+            start_positions = batch['start_positions'].to(device)
+            end_positions = batch['end_positions'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs=model(input_ids, attention_mask=attention_mask, start_positions=start_positions, end_positions=end_positions, labels = labels, return_dict=True)
+            
+            avg_total_loss.append(float(outputs.total_loss))
+            avg_lm_loss.append(float(outputs.lm_loss))
+            avg_wp_loss.append(float(outputs.wp_loss))
+            
+            #Evalute ROUGE scores
+            gen_kwargs = {
+                "max_length": args.max_target_length,
+                "num_beams": args.num_beams,
+            }
+            labels = batch["labels"]
+            
+            generated_tokens = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs,
+            )
+
+            generated_tokens = generated_tokens.cpu().numpy()
+            labels = labels.cpu().numpy()
+            
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id) #To ignore labels that are pad_tokens
+            if isinstance(generated_tokens, tuple):
+                generated_tokens = generated_tokens[0]
+            
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+            metric.add_batch(predictions=decoded_preds, references=decoded_labels)
+            
+        result = metric.compute(use_stemmer=True)
+        # Extract a few results from ROUGE
+        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+        result = {k: round(v, 4) for k, v in result.items()}
+      
+    
+    return np.mean(avg_total_loss), np.mean(avg_lm_loss), np.mean(avg_wp_loss), result, decoded_preds
 
 def postprocess_text(preds, labels):
         preds = [pred.strip() for pred in preds]
@@ -159,11 +220,10 @@ def generate_counters(model, tokenizer, data_loader, gen_kwargs, skip_special_to
                 **gen_kwargs
             )
             
-            generated_tokens = generated_tokens.cpu().numpy()
-            
             if isinstance(generated_tokens, tuple):
                 generated_tokens = generated_tokens[0]
-            
+                
+            generated_tokens = generated_tokens.cpu().numpy()
             decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=skip_special_tokens)
             
             generated_attacks += decoded_preds
@@ -171,78 +231,9 @@ def generate_counters(model, tokenizer, data_loader, gen_kwargs, skip_special_to
     return generated_attacks
 
 
-def generate_and_evaluate_text(model, tokenizer, data_loader, args, gen_kwargs):
-    metric = load_metric('rouge')
-    bertscore_metric = load_metric('bertscore')
-    
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    
-    generated_attacks = []
-    gt_attacks = []
-    detected_weak_premises = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            start_positions = batch['start_positions'].to(device)
-            end_positions = batch['end_positions'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-
-            
-            generated_tokens = model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                **gen_kwargs
-            )
-            
-            generated_tokens = generated_tokens.cpu().numpy()
-            labels = labels.cpu().numpy()
-            
-            labels = np.where(labels != -100, labels, tokenizer.pad_token_id) #To ignore labels that are pad_tokens
-            if isinstance(generated_tokens, tuple):
-                generated_tokens = generated_tokens[0]
-            
-            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-            decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-
-            metric.add_batch(predictions=decoded_preds, references=decoded_labels)
-            bertscore_metric.add_batch(predictions=decoded_preds, references=decoded_labels)
-            
-            generated_attacks += decoded_preds
-            gt_attacks += decoded_labels
-            
-        result = metric.compute(use_stemmer=True)
-        bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
-
-        # Extract a few results from ROUGE
-        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-        result = {k: round(v, 4) for k, v in result.items()}
-        result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
-    
-    return result, generated_attacks, gt_attacks, detected_weak_premises
-
-
 def evaluate_gen_attacks(generated_attacks, gt_attacks):
-    metric = load_metric('rouge')
     bertscore_metric = load_metric('bertscore')
     bleu_score = load_metric('bleu')
-
-    #rouge doesn't accept a list of list so we will flatten
-#     if type(gt_attacks[0]) == list:
-#         flattend_list = [(item[0], gt) for item in zip(generated_attacks, gt_attacks) for gt in item[1]]
-#         gt_flatten_attacks, pred_flatten_attacks = zip(*flattend_list)
-#         metric.add_batch(predictions=pred_flatten_attacks, references=gt_flatten_attacks)
-#     else:
-#         metric.add_batch(predictions=generated_attacks, references=gt_attacks)
-
-    # Extract a few results from ROUGE
-#     result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-#     result = {k: round(v, 4) for k, v in result.items()}
-#     result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
 
     bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)    
     bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
@@ -250,70 +241,13 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks):
     gts = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
     preds = [nltk.word_tokenize(x) for x in generated_attacks]
     
+    #print(gts)
+    #print(preds)
     bleu_score.add_batch(predictions=preds, references=gts)    
     result = bleu_score.compute()
     
     result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
     return result
-            
-def eval_on_validation(model, tokenizer, valid_loader, args):
-    
-    metric = load_metric('rouge')
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    
-    avg_total_loss = []
-    avg_lm_loss = []
-    avg_wp_loss = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch in valid_loader:
-            input_ids = batch['input_ids'].to(device)
-            start_positions = batch['start_positions'].to(device)
-            end_positions = batch['end_positions'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-
-            outputs=model(input_ids, attention_mask=attention_mask, start_positions=start_positions, end_positions=end_positions, labels = labels, return_dict=True)
-            
-            avg_total_loss.append(float(outputs.total_loss))
-            avg_lm_loss.append(float(outputs.lm_loss))
-            avg_wp_loss.append(float(outputs.wp_loss))
-            
-            #Evalute ROUGE scores
-            gen_kwargs = {
-                "max_length": args.max_target_length,
-                "num_beams": args.num_beams,
-            }
-            labels = batch["labels"]
-            
-            generated_tokens = model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                **gen_kwargs,
-            )
-
-            generated_tokens = generated_tokens.cpu().numpy()
-            labels = labels.cpu().numpy()
-            
-            labels = np.where(labels != -100, labels, tokenizer.pad_token_id) #To ignore labels that are pad_tokens
-            if isinstance(generated_tokens, tuple):
-                generated_tokens = generated_tokens[0]
-            
-            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-            decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-
-            metric.add_batch(predictions=decoded_preds, references=decoded_labels)
-            
-        result = metric.compute(use_stemmer=True)
-        # Extract a few results from ROUGE
-        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-        result = {k: round(v, 4) for k, v in result.items()}
-      
-    
-    return np.mean(avg_total_loss), np.mean(avg_lm_loss), np.mean(avg_wp_loss), result, decoded_preds
 
 #Encoding function for premises and conclusion experiments
 def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, conclusion_in_output=False, max_input_length=512, max_target_length=200):
@@ -343,43 +277,20 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
         
     # Setup the tokenizer for targets
     with tokenizer.as_target_tokenizer():
-        labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True, padding='max_length')
-
-#     print(text_inputs[0])
-#     print(model_inputs['input_ids'][0])
-#     print('-----------------')
-#     print(text_outputs[0])
-#     print(labels["input_ids"][0])
-    
+        labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True, padding='max_length')    
     
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
 def compute_metrics(eval_pred, tokenizer):
     predictions, labels = eval_pred
+
     decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     # Replace -100 in the labels as we can't decode them.
     labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
     decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
     
-    # Rouge expects a newline after each sentence
-    decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
-    decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
-    
-    result = rouge_metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-    # Extract a few results
-    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-    
-    #compute BertScore bertscore_metric
-    bertscore_result = bertscore_metric.compute(predictions=decoded_preds, references=decoded_labels, lang='en', rescale_with_baseline=True)
-    result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
-    
-    
-    # Add mean generated length
-    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in predictions]
-    result["gen_len"] = np.mean(prediction_lens)
-    
-    return {k: round(v, 4) for k, v in result.items()}
+    return evaluate_gen_attacks(decoded_preds, decoded_labels)
 
 def get_data_loaders(args, tokenizer):
     """ Prepare the dataset for training and evaluation """
