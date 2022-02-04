@@ -152,6 +152,11 @@ class Seq2TwoSeqTrainer(Seq2SeqTrainer):
             self.log({'eval_conclusionLoss': outputs['conc_loss'].item(),
                     'eval_counterLoss': outputs['count_loss'].item()})
 
+            if model.compute_dynamic_weights:
+                self.log({'eval_LogVar1': model.log_vars[0].item(),
+                    'eval_modelLogVar2': model.log_vars[1].item()})
+
+
         return (loss, outputs) if return_outputs else loss
 
 
@@ -186,7 +191,8 @@ class BartModelV2(BartPretrainedModel):
         if self.compute_dynamic_weights:
             #Add a layer for the dynamic loss unit
             #slim.fully_connected(input_lossweights_embedings, 2, activation_fn=None,weights_initializer=tf.truncated_normal_initializer(stddev=0.1), weights_regularizer=slim.l2_regularizer(args.weight_decay),scope='Logits_lossweights', reuse=False)
-            self.dynamic_loss_unit = nn.utils.weight_norm(nn.Linear(config.d_model, 2))
+            #self.dynamic_loss_unit = nn.utils.weight_norm(nn.Linear(config.d_model, 2))
+            self.log_vars = torch.nn.Parameter(torch.zeros(2))
 
         
         self.init_weights()
@@ -310,10 +316,11 @@ class BartModelV2(BartPretrainedModel):
             )
 
 
-        if self.compute_dynamic_weights:
-            shared_output=encoder_outputs.last_hidden_state.detach() #because we don't want to backpopagate over the whole encoder
+        #if self.compute_dynamic_weights:
+            #shared_output=encoder_outputs.last_hidden_state.detach() #because we don't want to backpopagate over the whole encoder
             #Now compute the dynamic weights of the two tasks
-            dynamic_weights = nn.functional.softmax(self.dynamic_loss_unit(shared_output))
+            #dynamic_weights = nn.functional.softmax(self.dynamic_loss_unit(shared_output))
+
         
         if self.conc_decoder:
             # First decode conclusion
@@ -368,27 +375,33 @@ class BartModelV2(BartPretrainedModel):
             count_lm_loss = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), counter_labels.view(-1))  if counter_labels is not None else 0
             
             if self.compute_dynamic_weights:
+                losses = torch.stack([conc_lm_loss, count_lm_loss])
                 #Retriev loss weights from the dynamic weights unit
-                conc_loss_weight  = dynamic_weights[:,0].mean()
-                counter_loss_weight = dynamic_weights[:,1].mean()
-                print(conc_loss_weight)
-                print(counter_loss_weight)
+                #conc_loss_weight  = dynamic_weights[:,0].mean()
+                #counter_loss_weight = dynamic_weights[:,1].mean()
+                dtype  = conc_lm_loss.dtype
+                device = conc_lm_loss.device
+                stds = (torch.exp(self.log_vars)**(1/2)).to(device).to(dtype)
+                #self.is_regression = self.is_regression.to(device).to(dtype)
+                coeffs = 1 /(stds**2)
+                multi_task_losses = coeffs*losses + torch.log(stds)
+                loss = multi_task_losses.mean()
+
             else:
                 conc_loss_weight  = self.conc_loss_weight
                 counter_loss_weight = self.counter_loss_weight
+                loss = counter_loss_weight * count_lm_loss + conc_loss_weight * conc_lm_loss
 
-            loss = counter_loss_weight * count_lm_loss + conc_loss_weight * conc_lm_loss
 
-
-            if self.compute_dynamic_weights:
-                #compute the loss of the dynamic loss weight unit
-                sigma = 0.01
-                weights_loss = (conc_lm_loss / conc_loss_weight + sigma) + (count_lm_loss / counter_loss_weight +sigma)
+            # if self.compute_dynamic_weights:
+            #     #compute the loss of the dynamic loss weight unit
+            #     sigma = 0.01
+            #     weights_loss = (conc_lm_loss / conc_loss_weight + sigma) + (count_lm_loss / counter_loss_weight +sigma)
             
 
         else:
             count_lm_logits = self.count_lm_head(counter_decoder_outputs['last_hidden_state']) + self.final_logits_bias
-            count_lm_loss = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), counter_labels.view(-1))  if counter_labels is not None else 0
+            count_lm_loss   = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), counter_labels.view(-1))  if counter_labels is not None else 0
             loss = count_lm_loss
 
             
@@ -406,7 +419,6 @@ class BartModelV2(BartPretrainedModel):
         
         return MultiTaskArgGenModelOutput(
             loss = loss,
-            dynamic_weight_loss=weights_loss if self.compute_dynamic_weights else None,
             conc_loss= conc_lm_loss if self.conc_decoder else None,
             count_loss= count_lm_loss,
 
