@@ -19,34 +19,39 @@ from transformers.trainer_pt_utils import nested_detach
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-@dataclass
-class MultiTaskArgGenModelOutput(ModelOutput):
+class Collate:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
 
-    loss: Optional[torch.FloatTensor] = None
-    dynamic_weight_loss: Optional[torch.FloatTensor] = None
-    conc_loss : Optional[torch.FloatTensor] = None
-    count_loss : Optional[torch.FloatTensor] = None
-
-    conc_lm_logits:torch.FloatTensor = None
-    count_lm_logits:torch.FloatTensor = None
-    logits: torch.FloatTensor = None
+    def __call__(self, batch):
+        output = dict()
+        output["input_ids"] = [sample["input_ids"] for sample in batch]
+        output["attention_mask"] = [sample["attention_mask"] for sample in batch]
+        output["global_attention_mask"] = [sample["global_attention_mask"] for sample in batch]
+        output["labels"] = [sample["labels"] for sample in batch]
         
-    counter_last_hidden_state: torch.FloatTensor = None
-    counter_past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    counter_decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    counter_decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
-    conclusion_last_hidden_state: torch.FloatTensor = None
-    conclusion_past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    conclusion_decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    conclusion_decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
-    counter_cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
-    conclusion_cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
-    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
-    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+        # calculate max token length of this batch
+        batch_max = max([len(ids) for ids in output["input_ids"]])
 
+        # add padding
+        if self.tokenizer.padding_side == "right":
+            output["input_ids"] = [s + (batch_max - len(s)) * [self.tokenizer.pad_token_id] for s in output["input_ids"]]
+            output["labels"] = [s + (batch_max - len(s)) * [-100] for s in output["labels"]]
+            output["attention_mask"] = [s + (batch_max - len(s)) * [0] for s in output["attention_mask"]]
+            output["global_attention_mask"] = [s + (batch_max - len(s)) * [0] for s in output["global_attention_mask"]]
+        else:
+            output["input_ids"] = [(batch_max - len(s)) * [self.tokenizer.pad_token_id] + s for s in output["input_ids"]]
+            output["labels"] = [(batch_max - len(s)) * [-100] + s for s in output["labels"]]
+            output["attention_mask"] = [(batch_max - len(s)) * [0] + s for s in output["attention_mask"]]
+            output["global_attention_mask"] = [(batch_max - len(s)) * [0] + s for s in output["global_attention_mask"]]
 
-logger = logging.get_logger(__name__)
+        # convert to tensors
+        output["input_ids"] = torch.tensor(output["input_ids"], dtype=torch.long)
+        output["attention_mask"] = torch.tensor(output["attention_mask"], dtype=torch.long)
+        output["global_attention_mask"] = torch.tensor(output["global_attention_mask"], dtype=torch.long)
+        output["labels"] = torch.tensor(output["labels"], dtype=torch.long)
+
+        return output
 
 class Seq2TwoSeqTrainer(Seq2SeqTrainer):
 
@@ -92,95 +97,139 @@ class Seq2TwoSeqTrainer(Seq2SeqTrainer):
 
         # XXX: adapt synced_gpus for fairscale as well
         gen_kwargs = {
-            "max_length": 200,
-            "num_beams": 1,
-            "synced_gpus": False
+            "max_length": self._max_length if self._max_length is not None else self.model.config.max_length,
+            "num_beams": self._num_beams if self._num_beams is not None else self.model.config.num_beams,
+            "synced_gpus": True if is_deepspeed_zero3_enabled() else False,
         }
 
-        
-        generation_inputs = inputs[self.model.main_input_name]
+        # prepare generation inputs
+        # some encoder-decoder models can have varying encder's and thus
+        # varying model input names
+        if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
+            generation_inputs = inputs[self.model.encoder.main_input_name]
+        else:
+            generation_inputs = inputs[self.model.main_input_name]
 
-        counter_generated_tokens, conclusion_generated_tokens = self.model.generate(
+        generated_tokens = self.model.generate(
             generation_inputs,
             attention_mask=inputs.get("attention_mask", None),
             **gen_kwargs,
         )
-
         # in case the batch is shorter than max length, the output should be padded
-        if counter_generated_tokens.shape[-1] < gen_kwargs["max_length"]:
-            counter_generated_tokens = self._pad_tensors_to_max_len(counter_generated_tokens, gen_kwargs["max_length"])
+        if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
+            generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
 
         with torch.no_grad():
-            outputs = model(**inputs)
-            loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
-            
+            with self.autocast_smart_context_manager():
+                outputs = model(**inputs)
+            if has_labels:
+                if self.label_smoother is not None:
+                    loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()
+                else:
+                    loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
+            else:
+                loss = None
+
         if self.args.prediction_loss_only:
             return (loss, None, None)
 
-        counter_labels = inputs["counter_labels"]
-        if counter_labels.shape[-1] < gen_kwargs["max_length"]:
-            counter_labels = self._pad_tensors_to_max_len(counter_labels, gen_kwargs["max_length"])
+        if has_labels:
+            labels = inputs["labels"]
+            if labels.shape[-1] < gen_kwargs["max_length"]:
+                labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
+        else:
+            labels = None
 
-        return (loss, counter_generated_tokens, counter_labels)
+        return (loss, generated_tokens, labels)
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+    # def compute_loss(self, model, inputs, return_outputs=False):
+    #     """
+    #     How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
-        Subclass and override for custom behavior.
-        """
+    #     Subclass and override for custom behavior.
+    #     """
         
-        #We dont perform label smoothing for now
-        # if self.label_smoother is not None and "labels" in inputs:
-        #     labels = inputs.pop("labels")
-        # else:
-        #     labels = None
+    #     #We dont perform label smoothing for now
+    #     # if self.label_smoother is not None and "labels" in inputs:
+    #     #     labels = inputs.pop("labels")
+    #     # else:
+    #     #     labels = None
 
-        outputs = model(**inputs)
-        # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
-        if self.args.past_index >= 0:
-            self._past = outputs[self.args.past_index]
+    #     outputs = model(**inputs)
+    #     # Save past state if it exists
+    #     # TODO: this needs to be fixed and made cleaner later.
+    #     if self.args.past_index >= 0:
+    #         self._past = outputs[self.args.past_index]
 
-        # if labels is not None:
-        #     loss = self.label_smoother(outputs, labels)
+    #     # if labels is not None:
+    #     #     loss = self.label_smoother(outputs, labels)
             
-        # We don't use .loss here since the model may return tuples instead of ModelOutput.
-        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+    #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
+    #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-        if model.conc_decoder:
-            self.log({'eval_conclusionLoss': outputs['conc_loss'].item(),
-                    'eval_counterLoss': outputs['count_loss'].item()})
+    #     if model.conc_decoder:
+    #         self.log({'eval_conclusionLoss': outputs['conc_loss'].item(),
+    #                 'eval_counterLoss': outputs['count_loss'].item()})
 
-            if model.compute_dynamic_weights:
-                self.log({'eval_LogVar1': model.log_vars[0].item(),
-                    'eval_modelLogVar2': model.log_vars[1].item()})
-
-
-        return (loss, outputs) if return_outputs else loss
+    #         if model.compute_dynamic_weights:
+    #             self.log({'eval_LogVar1': model.log_vars[0].item(),
+    #                 'eval_modelLogVar2': model.log_vars[1].item()})
 
 
+    #     return (loss, outputs) if return_outputs else loss
+
+@dataclass
+class MultiTaskArgGenModelOutput(ModelOutput):
+
+    loss: Optional[torch.FloatTensor] = None
+    dynamic_weight_loss: Optional[torch.FloatTensor] = None
+    conc_loss : Optional[torch.FloatTensor] = None
+    count_loss : Optional[torch.FloatTensor] = None
+
+    conc_lm_logits:torch.FloatTensor = None
+    count_lm_logits:torch.FloatTensor = None
+    logits: torch.FloatTensor = None
+        
+    last_hidden_state: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    conclusion_last_hidden_state: torch.FloatTensor = None
+    conclusion_past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    conclusion_decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    conclusion_decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    conclusion_cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
+logger = logging.get_logger(__name__)
 
 class BartModelV2(BartPretrainedModel):
     
     main_input_name = "input_ids"
+    _keys_to_ignore_on_load_missing = [r"final_logits_bias", r"conc_lm_head\.weight", r"count_lm_head\.weight", r"conclusion_decoder\.layers"]
 
     def __init__(self, config: BartConfig, compute_dynamic_weights=False, conc_loss_weight=0.5, counter_loss_weight=0.5, attention_to_conc=False, conc_decoder=False):
         super().__init__(config)
 
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
-        self.register_buffer("final_logits_bias", torch.zeros((1, self.shared.num_embeddings)))
+        
         
         self.encoder = BartEncoder(config, self.shared)
-        
+        self.decoder = BartDecoder(config, self.shared)
+
         if conc_decoder:
             self.conclusion_decoder = BartDecoder(config, self.shared)
             self.conc_lm_head = nn.Linear(config.d_model, self.shared.num_embeddings, bias=False)
         
-        self.counter_decoder = BartDecoder(config, self.shared)
-        self.count_lm_head = nn.Linear(config.d_model, self.shared.num_embeddings, bias=False)
         
+        self.count_lm_head = nn.Linear(config.d_model, self.shared.num_embeddings, bias=False)
+        self.register_buffer("final_logits_bias", torch.zeros((1, self.shared.num_embeddings)))
+
 
         self.conc_loss_weight = conc_loss_weight
         self.counter_loss_weight = counter_loss_weight
@@ -196,12 +245,42 @@ class BartModelV2(BartPretrainedModel):
 
         
         self.init_weights()
-        
+    
+    def get_input_embeddings(self):
+        return self.shared
+
+    def set_input_embeddings(self, value):
+        self.shared = value
+        self.encoder.embed_tokens = self.shared
+        self.decoder.embed_tokens = self.shared
+
     def get_encoder(self):
         return self.encoder
 
+    def get_decoder(self):
+        return self.decoder
 
-    def prepare_inputs_for_conclusion_generation(
+    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens)
+        self._resize_final_logits_bias(new_num_tokens)
+        return new_embeddings
+
+    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
+        old_num_tokens = self.final_logits_bias.shape[-1]
+        if new_num_tokens <= old_num_tokens:
+            new_bias = self.final_logits_bias[:, :new_num_tokens]
+        else:
+            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
+            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
+        self.register_buffer("final_logits_bias", new_bias)
+
+    def get_output_embeddings(self):
+        return self.count_lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.count_lm_head = new_embeddings
+
+    def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
         past=None,
@@ -213,29 +292,24 @@ class BartModelV2(BartPretrainedModel):
         encoder_outputs=None,
         **kwargs
     ):
-        
-        
-        if not isinstance(encoder_outputs, BaseModelOutput):
-            encoder_outputs = BaseModelOutput(
-                last_hidden_state=encoder_outputs[0],
-                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
-                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
-            )
-
         # cut decoder_input_ids if past is used
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
-
         return {
-            "input_ids": decoder_input_ids,
-            "encoder_hidden_states": encoder_outputs[0],
+            "input_ids": None,  # encoder_outputs is defined. input_ids not needed
+            "encoder_outputs": encoder_outputs,
             "past_key_values": past,
+            "decoder_input_ids": decoder_input_ids,
+            "attention_mask": attention_mask,
             "head_mask": head_mask,
-            "head_mask": decoder_head_mask,
+            "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
         }
+
+    def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
+        return shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
 
     @staticmethod
     def _reorder_cache(past, beam_idx):
@@ -251,24 +325,24 @@ class BartModelV2(BartPretrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
         conclusion_decoder_input_ids=None,
         conclusion_decoder_attention_mask=None,
-        counter_decoder_input_ids=None,
-        counter_decoder_attention_mask=None,
         head_mask=None,
         decoder_head_mask=None,
         cross_attn_head_mask=None,
         encoder_outputs=None,
         past_key_values=None,
         inputs_embeds=None,
+        decoder_inputs_embeds=None,
         conclusion_decoder_inputs_embeds=None,
-        counter_decoder_inputs_embeds=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        conclusion_labels=None,
-        counter_labels=None
+        labels=None,
+        conclusion_labels=None
     ):
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -290,10 +364,10 @@ class BartModelV2(BartPretrainedModel):
                     conclusion_labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
                 
-        if counter_labels is not None:
-            if counter_decoder_input_ids is None and counter_decoder_inputs_embeds is None:
-                counter_decoder_input_ids = shift_tokens_right(
-                    counter_labels, self.config.pad_token_id, self.config.decoder_start_token_id
+        if labels is not None:
+            if decoder_input_ids is None and decoder_inputs_embeds is None:
+                decoder_input_ids = shift_tokens_right(
+                    labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
 
         if encoder_outputs is None:
@@ -315,14 +389,8 @@ class BartModelV2(BartPretrainedModel):
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
 
-
-        #if self.compute_dynamic_weights:
-            #shared_output=encoder_outputs.last_hidden_state.detach() #because we don't want to backpopagate over the whole encoder
-            #Now compute the dynamic weights of the two tasks
-            #dynamic_weights = nn.functional.softmax(self.dynamic_loss_unit(shared_output))
-
         
-        if self.conc_decoder:
+        if self.conc_decoder and conclusion_labels != None: #Run conclusion decoder only when training
             # First decode conclusion
             conclusion_decoder_outputs = self.conclusion_decoder(
                 input_ids=conclusion_decoder_input_ids,
@@ -339,104 +407,89 @@ class BartModelV2(BartPretrainedModel):
                 return_dict=return_dict,
             )
         
-        # Second extend the encoder_hidden_states with the conclusion_decoder output_states if attention to conclusion is set to True
-        encoder_hidden_states= torch.cat([conclusion_decoder_outputs[0], encoder_outputs[0]], axis=1) if self.attention_to_conc else encoder_outputs[0]
-        encoder_attention_mask = torch.cat([conclusion_decoder_attention_mask, attention_mask], axis=1) if self.attention_to_conc else attention_mask
         
-        # Third decode the counter
+        # Second decode the counter
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-        counter_decoder_outputs = self.counter_decoder(
-            input_ids=counter_decoder_input_ids,
-            attention_mask=counter_decoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+        counter_decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=attention_mask,
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
             past_key_values=past_key_values,
-            inputs_embeds=counter_decoder_inputs_embeds,
+            inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
 
-        loss_fct = CrossEntropyLoss()
-        
-        #print(conclusion_decoder_outputs['last_hidden_state'].size())
-        #print(conclusion_decoder_input_ids.size())
-        #print(conclusion_labels.size())
-        if self.conc_decoder:
+        count_lm_logits = self.count_lm_head(counter_decoder_outputs['last_hidden_state']) + self.final_logits_bias
+
+        loss = None
+        conc_lm_loss = None
+        count_lm_loss = None
+        conc_lm_logits = None
+
+        if labels != None and conclusion_labels != None:
+
+            conc_lm_logits = self.conc_lm_head(conclusion_decoder_outputs['last_hidden_state']) + self.final_logits_bias if self.conc_decoder else None
+
+            #Compute the Loss
+            loss_fct = CrossEntropyLoss()
             
-            
-            conc_lm_logits = self.conc_lm_head(conclusion_decoder_outputs['last_hidden_state']) + self.final_logits_bias
-            conc_lm_loss = loss_fct(conc_lm_logits.view(-1, self.config.vocab_size), conclusion_labels.view(-1)) if conclusion_labels is not None else 0
-        
-            count_lm_logits = self.count_lm_head(counter_decoder_outputs['last_hidden_state']) + self.final_logits_bias
-            count_lm_loss = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), counter_labels.view(-1))  if counter_labels is not None else 0
-            
-            if self.compute_dynamic_weights:
-                losses = torch.stack([conc_lm_loss, count_lm_loss])
-                #Retriev loss weights from the dynamic weights unit
-                #conc_loss_weight  = dynamic_weights[:,0].mean()
-                #counter_loss_weight = dynamic_weights[:,1].mean()
-                dtype  = conc_lm_loss.dtype
-                device = conc_lm_loss.device
-                stds = (torch.exp(self.log_vars)**(1/2)).to(device).to(dtype)
-                #self.is_regression = self.is_regression.to(device).to(dtype)
-                coeffs = 1 /(stds**2)
-                multi_task_losses = coeffs*losses + torch.log(stds)
-                loss = multi_task_losses.mean()
+            if self.conc_decoder:    
+                
+                conc_lm_loss = loss_fct(conc_lm_logits.view(-1, self.config.vocab_size), conclusion_labels.view(-1)) if conclusion_labels is not None else None
+                count_lm_loss = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), labels.view(-1))  if labels is not None else None
+                
+                if self.compute_dynamic_weights and conc_lm_loss != 0: #if 0 then its prediction mode
+                    losses = torch.stack([conc_lm_loss, count_lm_loss])
+                    #Retriev loss weights from the dynamic weights unit
+                    #conc_loss_weight  = dynamic_weights[:,0].mean()
+                    #counter_loss_weight = dynamic_weights[:,1].mean()
+                    dtype  = conc_lm_loss.dtype
+                    device = conc_lm_loss.device
+                    stds = (torch.exp(self.log_vars)**(1/2)).to(device).to(dtype)
+                    #self.is_regression = self.is_regression.to(device).to(dtype)
+                    coeffs = 1 /(stds**2)
+                    multi_task_losses = coeffs*losses + torch.log(stds)
+                    loss = multi_task_losses.mean()
+                else:
+                    conc_loss_weight  = self.conc_loss_weight
+                    counter_loss_weight = self.counter_loss_weight
+                    loss = counter_loss_weight * count_lm_loss + conc_loss_weight * conc_lm_loss
 
             else:
-                conc_loss_weight  = self.conc_loss_weight
-                counter_loss_weight = self.counter_loss_weight
-                loss = counter_loss_weight * count_lm_loss + conc_loss_weight * conc_lm_loss
+                count_lm_loss = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), labels.view(-1))  if labels is not None else 0
+                loss = count_lm_loss
 
-
-            # if self.compute_dynamic_weights:
-            #     #compute the loss of the dynamic loss weight unit
-            #     sigma = 0.01
-            #     weights_loss = (conc_lm_loss / conc_loss_weight + sigma) + (count_lm_loss / counter_loss_weight +sigma)
-            
-
-        else:
-            count_lm_logits = self.count_lm_head(counter_decoder_outputs['last_hidden_state']) + self.final_logits_bias
-            count_lm_loss   = loss_fct(count_lm_logits.view(-1, self.config.vocab_size), counter_labels.view(-1))  if counter_labels is not None else 0
-            loss = count_lm_loss
-
-            
-        
-        #print(count_lm_loss.item(), conc_lm_loss.item())
         
         if not return_dict:
-            if self.conc_decoder:
-                return counter_decoder_outputs + conclusion_decoder_outputs + encoder_outputs
-            else:
-                return counter_decoder_outputs + encoder_outputs
+            return counter_decoder_outputs + encoder_outputs
                 
 
-        
-        
         return MultiTaskArgGenModelOutput(
             loss = loss,
-            conc_loss= conc_lm_loss if self.conc_decoder else None,
+            conc_loss= conc_lm_loss,
             count_loss= count_lm_loss,
 
             logits = count_lm_logits,
-            conc_lm_logits=conc_lm_logits if self.conc_decoder else None,
-            count_lm_logits=count_lm_logits,
+            #conc_lm_logits=conc_lm_logits if self.conc_decoder else None,
+            #count_lm_logits=count_lm_logits,
             
-            counter_last_hidden_state=counter_decoder_outputs.last_hidden_state,
-            counter_past_key_values=counter_decoder_outputs.past_key_values,
-            counter_decoder_hidden_states=counter_decoder_outputs.hidden_states,
-            counter_decoder_attentions=counter_decoder_outputs.attentions,
-            counter_cross_attentions=counter_decoder_outputs.cross_attentions,
+            decoder_hidden_states=counter_decoder_outputs.hidden_states,
+            past_key_values=counter_decoder_outputs.past_key_values,
+            last_hidden_state=counter_decoder_outputs.last_hidden_state,
+            decoder_attentions=counter_decoder_outputs.attentions,
+            cross_attentions=counter_decoder_outputs.cross_attentions,
             
-            conclusion_last_hidden_state=conclusion_decoder_outputs.last_hidden_state if self.conc_decoder else None,
-            conclusion_past_key_values=conclusion_decoder_outputs.past_key_values if self.conc_decoder else None,
-            conclusion_decoder_hidden_states=conclusion_decoder_outputs.hidden_states if self.conc_decoder else None,
-            conclusion_decoder_attentions=conclusion_decoder_outputs.attentions if self.conc_decoder else None,
-            conclusion_cross_attentions=conclusion_decoder_outputs.cross_attentions if self.conc_decoder else None,
+            # conclusion_last_hidden_state=conclusion_decoder_outputs.last_hidden_state if self.conc_decoder else None,
+            # conclusion_past_key_values=conclusion_decoder_outputs.past_key_values if self.conc_decoder else None,
+            # conclusion_decoder_hidden_states=conclusion_decoder_outputs.hidden_states if self.conc_decoder else None,
+            # conclusion_decoder_attentions=conclusion_decoder_outputs.attentions if self.conc_decoder else None,
+            # conclusion_cross_attentions=conclusion_decoder_outputs.cross_attentions if self.conc_decoder else None,
             
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
@@ -444,453 +497,6 @@ class BartModelV2(BartPretrainedModel):
         )
 
 
-
-    
-    @torch.no_grad()
-    def greedy_search(
-        self,
-        input_ids: torch.LongTensor,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_scores: Optional[bool] = None,
-        return_dict_in_generate: Optional[bool] = None,
-        synced_gpus: Optional[bool] = None,
-        **model_kwargs,
-    ) -> Union[GreedySearchOutput, torch.LongTensor]:
-
-       
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        if max_length is not None:
-            warnings.warn(
-                "`max_length` is deprecated in this function, use `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
-                UserWarning,
-            )
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-
-
-        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        output_scores = output_scores if output_scores is not None else self.config.output_scores
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict_in_generate = (
-            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
-        )
-
-        # init attention / hidden states / scores tuples
-        scores = () if (return_dict_in_generate and output_scores) else None
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
-
-        conclusion_input_ids = input_ids.clone()
-        #To be used later for the counter_decoder
-        conclusion_hidden_states =  None
-        
-        if self.conc_decoder:
-
-            # keep track of which sequences are already finished
-            unfinished_sequences = conclusion_input_ids.new(conclusion_input_ids.shape[0]).fill_(1)
-            cur_len = conclusion_input_ids.shape[-1]
-
-            #FIRST DECODE A CONCLUSION.....
-            this_peer_finished = False  # used by synced_gpus only
-            while True:
-
-                if synced_gpus:
-                    # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
-                    # The following logic allows an early break if all peers finished generating their sequence
-                    this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(conclusion_input_ids.device)
-                    # send 0.0 if we finished, 1.0 otherwise
-                    dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
-                    # did all peers finish? the reduced sum will be 0.0 then
-                    if this_peer_finished_flag.item() == 0.0:
-                        break
-
-                # prepare model inputs
-                model_inputs = self.prepare_inputs_for_conclusion_generation(conclusion_input_ids, **model_kwargs)
-
-                outputs = self.conclusion_decoder(
-                    **model_inputs,
-                    return_dict=True
-                )
-
-                if synced_gpus and this_peer_finished:
-                    cur_len = cur_len + 1
-                    continue  # don't waste resources running the code we don't need
-
-                next_token_logits = self.conc_lm_head(outputs['last_hidden_state']) + self.final_logits_bias
-                next_token_logits = next_token_logits[:, -1, :]
-
-                #We need to save the last conclusion_decoder_hidden_state anyway
-                conclusion_hidden_states = outputs.last_hidden_state
-
-                # pre-process distribution
-                next_tokens_scores = logits_processor(conclusion_input_ids, next_token_logits)
-
-                # argmax
-                next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-
-                # finished sentences should have their next token be a padding token
-                if eos_token_id is not None:
-                    if pad_token_id is None:
-                        raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-                # update generated ids, model inputs, and length for next step
-                conclusion_input_ids = torch.cat([conclusion_input_ids, next_tokens[:, None]], dim=-1)
-                model_kwargs = self._update_model_kwargs_for_generation(
-                    outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
-                )
-                cur_len = cur_len + 1
-
-                # if eos_token was found in one sentence, set sentence to finished
-                if eos_token_id is not None:
-                    unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-                # stop when each sentence is finished, or if we exceed the maximum length
-                if unfinished_sequences.max() == 0 or stopping_criteria(conclusion_input_ids, scores):
-                    if not synced_gpus:
-                        break
-                    else:
-                        this_peer_finished = True
-        
-        
-
-        model_kwargs['past_key_values'] = None #reset the past_key_values
-        model_kwargs['past'] = None #reset the past_key_values
-        counter_input_ids = input_ids.clone()        
-
-        # keep track of which sequences are already finished
-        unfinished_sequences = counter_input_ids.new(counter_input_ids.shape[0]).fill_(1)
-        cur_len = counter_input_ids.shape[-1]
-        
-        #Second DECODE the Counter
-        this_peer_finished = False  # used by synced_gpus only
-        while True:
-
-            if synced_gpus:
-                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
-                # The following logic allows an early break if all peers finished generating their sequence
-                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(counter_input_ids.device)
-                # send 0.0 if we finished, 1.0 otherwise
-                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
-                # did all peers finish? the reduced sum will be 0.0 then
-                if this_peer_finished_flag.item() == 0.0:
-                    break
-
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_counter_generation(counter_input_ids, conclusion_decoder_last_hidden_state=conclusion_hidden_states,  **model_kwargs)
-            
-            
-            outputs = self.counter_decoder(
-                **model_inputs,
-                return_dict=True
-            )
-
-            if synced_gpus and this_peer_finished:
-                cur_len = cur_len + 1
-                continue  # don't waste resources running the code we don't need
-
-            next_token_logits = self.count_lm_head(outputs['last_hidden_state']) + self.final_logits_bias
-            next_token_logits = next_token_logits[:, -1, :]
-
-            # pre-process distribution
-            next_tokens_scores = logits_processor(counter_input_ids, next_token_logits)
-
-            # argmax
-            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-            # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # update generated ids, model inputs, and length for next step
-            counter_input_ids = torch.cat([counter_input_ids, next_tokens[:, None]], dim=-1)
-            
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
-            )
-            cur_len = cur_len + 1
-
-            # if eos_token was found in one sentence, set sentence to finished
-            if eos_token_id is not None:
-                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-            # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(counter_input_ids, scores):
-                if not synced_gpus:
-                    break
-                else:
-                    this_peer_finished = True
-
-        return counter_input_ids, conclusion_input_ids
-
-
-    def prepare_inputs_for_counter_generation(
-            self,
-            decoder_input_ids,
-            past=None,
-            attention_mask=None,
-            head_mask=None,
-            decoder_head_mask=None,
-            cross_attn_head_mask=None,
-            use_cache=None,
-            encoder_outputs=None,
-            conclusion_decoder_last_hidden_state=None,
-            conclusion_decoder_attention_mask=None,
-            **kwargs
-        ):
-
-            
-        if not isinstance(encoder_outputs, BaseModelOutput):
-            encoder_outputs = BaseModelOutput(
-                last_hidden_state=encoder_outputs[0],
-                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
-                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
-            )
-
-        
-        encoder_hidden_states= torch.cat([conclusion_decoder_last_hidden_state, encoder_outputs[0]], axis=1) if self.attention_to_conc else encoder_outputs[0]
-        conclusion_decoder_attention_mask = torch.ones(conclusion_decoder_last_hidden_state.shape[0:2]).to(device) if conclusion_decoder_attention_mask is None and self.conc_decoder != False else conclusion_decoder_attention_mask
-
-        attention_mask = torch.cat([conclusion_decoder_attention_mask, attention_mask], axis=1) if self.attention_to_conc else attention_mask
-
-
-        # cut decoder_input_ids if past is used
-        if past is not None:
-            decoder_input_ids = decoder_input_ids[:, -1:]
-
-
-        return {
-            "input_ids": decoder_input_ids,
-            "encoder_hidden_states": encoder_hidden_states,
-            "past_key_values": past,
-            "head_mask": head_mask,
-            "head_mask": decoder_head_mask,
-            "cross_attn_head_mask": cross_attn_head_mask,
-            "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
-        }
-
-
-    @torch.no_grad()
-    def sample(
-        self,
-        input_ids: torch.LongTensor,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        logits_warper: Optional[LogitsProcessorList] = None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_scores: Optional[bool] = None,
-        return_dict_in_generate: Optional[bool] = None,
-        synced_gpus: Optional[bool] = None,
-        **model_kwargs,
-    ) -> Union[SampleOutput, torch.LongTensor]:
-
-        # init values
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        if max_length is not None:
-            warnings.warn(
-                "`max_length` is deprecated in this function, use `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
-                UserWarning,
-            )
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
-        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        output_scores = output_scores if output_scores is not None else self.config.output_scores
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict_in_generate = (
-            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
-        )
-
-        # init attention / hidden states / scores tuples
-        scores = () if (return_dict_in_generate and output_scores) else None
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
-
-        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
-        if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-            encoder_hidden_states = (
-                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
-            )
-
-        conclusion_input_ids = input_ids.clone()
-        #To be used later for the counter_decoder
-        conclusion_hidden_states =  None
-
-        # keep track of which sequences are already finished
-        unfinished_sequences = conclusion_input_ids.new(conclusion_input_ids.shape[0]).fill_(1)
-        cur_len = conclusion_input_ids.shape[-1]
-
-
-        #FIRST DECODE A CONCLUSION.....
-        this_peer_finished = False  # used by synced_gpus only
-        # auto-regressive generation
-        while True:
-
-            if synced_gpus:
-                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
-                # The following logic allows an early break if all peers finished generating their sequence
-                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(conclusion_input_ids.device)
-                # send 0.0 if we finished, 1.0 otherwise
-                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
-                # did all peers finish? the reduced sum will be 0.0 then
-                if this_peer_finished_flag.item() == 0.0:
-                    break
-
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(conclusion_input_ids, **model_kwargs)
-
-            # forward pass to get next token
-            outputs = self.conclusion_decoder(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-
-            if synced_gpus and this_peer_finished:
-                cur_len = cur_len + 1
-                continue  # don't waste resources running the code we don't need
-
-            next_token_logits = self.conc_lm_head(outputs['last_hidden_state']) + self.final_logits_bias
-            next_token_logits = next_token_logits[:, -1, :]
-
-            # pre-process distribution
-            next_token_scores = logits_processor(conclusion_input_ids, next_token_logits)
-            next_token_scores = logits_warper(conclusion_input_ids, next_token_scores)
-
-            #We need to save the last conclusion_decoder_hidden_state anyway
-            conclusion_hidden_states = outputs.last_hidden_state
-
-
-            # sample
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
-            # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # update generated ids, model inputs, and length for next step
-            conclusion_input_ids = torch.cat([conclusion_input_ids, next_tokens[:, None]], dim=-1)
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
-            )
-            cur_len = cur_len + 1
-
-            # if eos_token was found in one sentence, set sentence to finished
-            if eos_token_id is not None:
-                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-            # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(conclusion_input_ids, scores):
-                if not synced_gpus:
-                    break
-                else:
-                    this_peer_finished = True
-
-
-
-        model_kwargs['past_key_values'] = None #reset the past_key_values
-        model_kwargs['past'] = None #reset the past_key_values
-        counter_input_ids = input_ids.clone()
-      
-
-        # keep track of which sequences are already finished
-        unfinished_sequences = counter_input_ids.new(counter_input_ids.shape[0]).fill_(1)
-        cur_len = counter_input_ids.shape[-1]
-
-
-        #FIRST DECODE A Counter.....
-        this_peer_finished = False  # used by synced_gpus only
-        # auto-regressive generation
-        while True:
-
-            if synced_gpus:
-                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
-                # The following logic allows an early break if all peers finished generating their sequence
-                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(counter_input_ids.device)
-                # send 0.0 if we finished, 1.0 otherwise
-                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
-                # did all peers finish? the reduced sum will be 0.0 then
-                if this_peer_finished_flag.item() == 0.0:
-                    break
-
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_counter_generation(counter_input_ids, conclusion_decoder_last_hidden_state=conclusion_hidden_states, **model_kwargs)
-
-            # forward pass to get next token
-            outputs = self.counter_decoder(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-
-            if synced_gpus and this_peer_finished:
-                cur_len = cur_len + 1
-                continue  # don't waste resources running the code we don't need
-
-            next_token_logits = self.count_lm_head(outputs['last_hidden_state']) + self.final_logits_bias
-            next_token_logits = next_token_logits[:, -1, :]
-
-            # pre-process distribution
-            next_token_scores = logits_processor(counter_input_ids, next_token_logits)
-            next_token_scores = logits_warper(counter_input_ids, next_token_scores)
-
-            # sample
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
-            # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # update generated ids, model inputs, and length for next step
-            counter_input_ids = torch.cat([counter_input_ids, next_tokens[:, None]], dim=-1)
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
-            )
-            cur_len = cur_len + 1
-
-            # if eos_token was found in one sentence, set sentence to finished
-            if eos_token_id is not None:
-                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-            # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(counter_input_ids, scores):
-                if not synced_gpus:
-                    break
-                else:
-                    this_peer_finished = True
-
-
-        return counter_input_ids, conclusion_input_ids
 
 if __name__ == "__main__":
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
