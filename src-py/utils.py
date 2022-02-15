@@ -259,6 +259,9 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
     if isinstance(premises[0], list):
         premises = [' '.join(x) for x in premises]
     
+    if conclusions is not None and isinstance(conclusions[0], list):
+        conclusions = [' '.join(x) for x in conclusions]
+
     if conclusions == None or conclusion_in_output== True: #if conclusion is passed and we don't want it in the toutput, then it should be added to the input for the known-conclusion model
         text_inputs = [ '<premises> ' + x + ' </premises>' for x in premises]
     else:
