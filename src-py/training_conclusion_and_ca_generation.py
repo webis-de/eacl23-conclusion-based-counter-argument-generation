@@ -18,23 +18,100 @@ from transformers import AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq, Seq2SeqT
 from transformers import BartTokenizer, BartForConditionalGeneration
 
 
-max_input_length = 512
-max_target_length = 200
+def fine_tune_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, valid_batch_size=4, epochs=3):
+
+    for lr in [2e-5, 3e-5, 5e-5]:
+        for bs in [32]:
+            tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
+            model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
+
+            #Add special tokens only if the conclusion in the input
+            if not args.conclusion_and_counter_generation:
+                special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+                num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+                model.resize_token_embeddings(len(tokenizer))
+
+            if args.masked_conclusion:
+                print('Training model with masked conclusion in the input')
+                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+                
+            elif args.conclusion_and_counter_generation:
+                print('Training model to generate conclusion and counter')
+                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+            else:
+                print('Training baseline with known conclusion in the input')
+                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+
+
+            data_collator= DataCollatorForSeq2Seq(tokenizer, model)
+
+            training_args = Seq2SeqTrainingArguments(
+                output_dir + "-model-{}".format(str(lr) + '-' + str(bs)),
+                evaluation_strategy = "steps",
+                logging_dir = args.logging_dir + "-model-{}".format(str(lr) + '-' + str(bs)),
+                eval_steps=500,
+                save_steps=500,
+                learning_rate=lr,
+                per_device_train_batch_size=bs,
+                per_device_eval_batch_size=32,
+                weight_decay=0.01,
+                save_total_limit=5,
+                num_train_epochs=1,
+                load_best_model_at_end=True,
+                predict_with_generate=True,
+                metric_for_best_model='bert-fscore',
+                label_names=['labels', 'conclusion_labels']
+            )
+
+            trainer = Seq2SeqTrainer(
+                model,
+                training_args,
+                train_dataset=training_enc_ds,
+                eval_dataset=valid_enc_ds,
+                data_collator=data_collator,
+                tokenizer=tokenizer,
+                compute_metrics=lambda x : compute_metrics(x, tokenizer)
+            )
+            
+            trainer.train()
+            trainer.save_model()
+
+def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, valid_batch_size=4, epochs=3):
+
+    max_input_length = 512
+    max_target_length = 200
 
 
 
-tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
-model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
+    tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
+    model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
 
-#Add special tokens
-special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
-num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-model.resize_token_embeddings(len(tokenizer))
+    #Add special tokens only if the conclusion in the input
+    if not args.conclusion_and_counter_generation:
+        special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+        num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+        model.resize_token_embeddings(len(tokenizer))
+
+    if args.masked_conclusion:
+        print('Training model with masked conclusion in the input')
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        
+    elif args.conclusion_and_counter_generation:
+        print('Training model to generate conclusion and counter')
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+    else:
+        print('Training baseline with known conclusion in the input')
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
 
 
-def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_batch_size=4, epochs=3):
 
-    args = Seq2SeqTrainingArguments(
+    training_args = Seq2SeqTrainingArguments(
         output_dir,
         evaluation_strategy = "steps",
         learning_rate=2e-5,
@@ -53,9 +130,9 @@ def train_model(train_ds, valid_ds, output_dir, training_batch_size=2, valid_bat
 
     trainer = Seq2SeqTrainer(
         model,
-        args,
-        train_dataset=train_ds,
-        eval_dataset=valid_ds,
+        training_args,
+        train_dataset=valid_enc_ds,
+        eval_dataset=valid_enc_ds,
         data_collator=data_collator,
         tokenizer=tokenizer,
         compute_metrics=lambda x : compute_metrics(x, tokenizer)
@@ -90,6 +167,10 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        '--logging_dir', type=str
+    )
+
+    parser.add_argument(
         '--downsample_training', type=float, default=1
     )
     
@@ -111,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_bs', type=int, default=32)
     parser.add_argument('--valid_bs', type=int, default=32)
     parser.add_argument('--train_epochs', type=int, default=6)
+    parser.add_argument('--fine_tune', action='store_true')
     
     args = parser.parse_args()
 
@@ -129,17 +211,7 @@ if __name__ == "__main__":
         tmp_ds = valid_ds.train_test_split(args.downsample_valid)
         valid_ds = tmp_ds['test']
 
-
-    if args.masked_conclusion:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-        
-    elif args.conclusion_and_counter_generation:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+    if args.fine_tune:
+        fine_tune_model(train_ds, valid_ds, args.output_dir, args, args.train_bs, args.valid_bs, args.train_epochs)
     else:
-        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-
-
-    train_model(training_enc_ds, valid_enc_ds, args.output_dir, args.train_bs, args.valid_bs, args.train_epochs)
+        train_model(train_ds, valid_ds, args.output_dir, args, args.train_bs, args.valid_bs, args.train_epochs)

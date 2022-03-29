@@ -231,7 +231,12 @@ def generate_counters(model, tokenizer, data_loader, gen_kwargs, skip_special_to
     return generated_attacks
 
 
-def evaluate_gen_attacks(generated_attacks, gt_attacks):
+def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False):
+    result = {
+        'bleu_scores': [],
+        'bert-fscores': []
+    }
+
     bertscore_metric = load_metric('bertscore')
     bleu_score = load_metric('bleu')
 
@@ -240,13 +245,32 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks):
 
     gts = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
     preds = [nltk.word_tokenize(x) for x in generated_attacks]
-    
-    #print(gts)
-    #print(preds)
+
     bleu_score.add_batch(predictions=preds, references=gts)    
-    result = bleu_score.compute()
+    bleuscore_result = bleu_score.compute()
+
+    result['bert-fscore'] =np.mean(bertscore_result['f1'])
+    result['bleu'] = bleuscore_result['bleu']
     
-    result['bert-fscore'] = round(np.mean(bertscore_result['f1']), 2)
+    if detailed:
+        result['bert-fscores'] = bertscore_result['f1']
+        result['bleu_scores']  = []
+        
+        for gt, pred in zip(gt_attacks, generated_attacks):
+            #remove empty counters
+            gt = [x for x in gt if x != '']
+            if len(gt) == 0 or len(pred) == 0:
+                print(gt, '---', pred, ' empty..')
+                continue
+                
+            gt  = [nltk.word_tokenize(gt)] if type(gt) != list else [nltk.word_tokenize(ref) for ref in gt]
+            pred= nltk.word_tokenize(pred)
+
+            bleu_score.add_batch(predictions=[pred], references=[gt])    
+            bluescore_result = bleu_score.compute()
+
+            result['bleu_scores'].append(bluescore_result['bleu'])
+        
     return result
 
 #Encoding function for premises and conclusion experiments
@@ -368,3 +392,56 @@ def get_data_loaders(args, tokenizer):
     logger.info("Valid dataset (Batch, Seq length): {}".format(datasets['valid']['labels'].shape))
     
     return train_loader, valid_loader
+
+def check_sig(v1s, v2s, alpha=0.05):
+    from scipy import stats
+
+    diff = list(map(lambda x1 , x2: x1 - x2, v1s, v2s))
+    is_normal = stats.shapiro(diff)[1] > alpha
+    
+    if is_normal:
+        print('Distribution is normal, so using ttest_rel')
+        ttest = stats.ttest_rel(v1s, v2s)
+        if ttest.statistic >=0:
+            if (ttest.pvalue/2) <= alpha:
+                return True
+            else:
+                return False
+        else:
+            return False
+
+    else:
+        print('Distribution is not normal, so using wilcoxon')
+        ttest = stats.wilcoxon(v1s, v2s, alternative='greater')
+        
+        if ttest.statistic >=0:
+            if (ttest.pvalue) <= alpha:
+                return True
+            else:
+                return False
+        else:
+            return False
+        
+def remove_similar_sents(df, threshold=0.75, masked_clm='masked_premises'):
+    from sentence_transformers import SentenceTransformer, util
+    import torch
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    #Compute semantic similarity
+    df['conclusion_embeddings']   = model.encode(df['title'].tolist()).tolist()
+    df['premises_embeddings']     = df['post'].apply(lambda x: model.encode(x))
+    df['conclusions_in_argument'] = df.apply(lambda x: util.pytorch_cos_sim(torch.tensor(x['conclusion_embeddings']), 
+                                                                                          torch.tensor(x['premises_embeddings'])
+                                                                    ).tolist()[0], axis=1)
+    df['conclusions_in_argument'] = df.apply(lambda x: list(zip(x['post'], x['conclusions_in_argument'])), axis=1)
+    
+    #filter-out sentences with semantic overlap of more than 0.75
+    df['conclusions_in_argument'] = df.apply(lambda x: [x[0] for x in x['conclusions_in_argument'] if x[1] > threshold], axis=1)
+    df['num_cand_conc'] = df['conclusions_in_argument'].apply(lambda x: len(x))
+    
+    df[masked_clm] = df.apply(lambda row: [p for p in row['post'] if p not in row['conclusions_in_argument']] , axis=1)
+    df['premises_with_conclusion'] = df.apply(lambda row: row['post'] + ['Therefore, '+row['title']], axis=1)
+    
+    df = df.drop(columns=['conclusion_embeddings', 'premises_embeddings', 'conclusions_in_argument'])
+    
+    return df
