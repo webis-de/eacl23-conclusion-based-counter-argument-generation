@@ -21,21 +21,6 @@ bertscore_metric = load_metric('bertscore')
 
 special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
 
-class Dataset(torch.utils.data.Dataset):
-    def __init__(self, ds):
-        self.ds = ds
-#         print(ds['labels'][0])
-#         print(ds['input_ids'][0])
-#         print(ds['start_positions'][0])
-#         print(ds['end_positions'][0])
-
-    def __getitem__(self, idx):
-        item = {key: val[idx] for key, val in self.ds.items()}
-        return item
-
-    def __len__(self):
-        return len(self.ds['labels'])
-
 def pad_input_sequence(sequence, tokenizer, padding_token, max_len=None, truncate=False):
     max_len  = max(len(x) for x in sequence) if max_len is None else max_len
     sequence = [s + [padding_token] * (max_len - len(s)) if len(s) <  max_len else s[:max_len]
@@ -274,7 +259,7 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False):
     return result
 
 #Encoding function for premises and conclusion experiments
-def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, conclusion_in_output=False, max_input_length=512, max_target_length=200):
+def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, conclusion_in_output=False, max_input_length=512, max_target_length=200, conclusion_idx=-1):
     premises   = examples[premises_clm]
     conclusions = examples[conclusion_clm] if conclusion_clm != None else None
     counters = examples[counter_clm]
@@ -284,7 +269,12 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
         premises = [' '.join(x) for x in premises]
     
     if conclusions is not None and isinstance(conclusions[0], list):
-        conclusions = [' '.join(x) for x in conclusions]
+        if conclusion_idx != -1:
+            conclusions = ['' if conclusion_idx > len(x)-1 else x[conclusion_idx] for x in conclusions] #just counter an empty conclusion if we don't have anymore conclusions at that required index....
+            print(conclusions[0:3])
+        else:
+            conclusions = [' '.join(x) for x in conclusions]
+            print('ddd', conclusions[0:3])
 
     if conclusions == None or conclusion_in_output== True: #if conclusion is passed and we don't want it in the toutput, then it should be added to the input for the known-conclusion model
         text_inputs = [ '<premises> ' + x + ' </premises>' for x in premises]
@@ -421,6 +411,26 @@ def check_sig(v1s, v2s, alpha=0.05):
                 return False
         else:
             return False
+        
+
+def split_dataframe_per_conc_similarity(df, conc_clm='conclusion', premises_clm='premises'):
+    from sentence_transformers import SentenceTransformer, util
+    import torch
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    #Compute semantic similarity
+    df['conclusion_embeddings']   = model.encode(df[conc_clm].tolist()).tolist()
+    df['premises_embeddings']     = df[premises_clm].apply(lambda x: model.encode(x))
+    df['conclusions_in_argument'] = df.apply(lambda x: util.pytorch_cos_sim(torch.tensor(x['conclusion_embeddings']), 
+                                                                                          torch.tensor(x['premises_embeddings'])
+                                                                    ).tolist()[0], axis=1)
+    
+    df['conclusions_in_argument'] = df.apply(lambda x: list(zip(x[premises_clm], x['conclusions_in_argument'])), axis=1)
+    df['max_sim_to_conclusion'] = df.apply(lambda x: max([x[1] for x in x['conclusions_in_argument']]), axis=1)
+    
+    df = df.drop(columns=['conclusion_embeddings', 'premises_embeddings', 'conclusions_in_argument'])
+    
+    return df
         
 def remove_similar_sents(df, threshold=0.75, masked_clm='masked_premises'):
     from sentence_transformers import SentenceTransformer, util
