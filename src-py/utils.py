@@ -16,8 +16,8 @@ from datasets import load_dataset, load_metric
 
 logger = logging.getLogger(__name__)
 
-rouge_metric = load_metric("rouge")
 bertscore_metric = load_metric('bertscore')
+bleu_score = load_metric('bleu')
 
 special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
 
@@ -222,9 +222,6 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False):
         'bert-fscores': []
     }
 
-    bertscore_metric = load_metric('bertscore')
-    bleu_score = load_metric('bleu')
-
     bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)    
     bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
 
@@ -271,27 +268,27 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
     if conclusions is not None and isinstance(conclusions[0], list):
         if conclusion_idx != -1:
             conclusions = ['' if conclusion_idx > len(x)-1 else x[conclusion_idx] for x in conclusions] #just counter an empty conclusion if we don't have anymore conclusions at that required index....
-            print(conclusions[0:3])
         else:
             conclusions = [' '.join(x) for x in conclusions]
-            print('ddd', conclusions[0:3])
 
     if conclusions == None or conclusion_in_output== True: #if conclusion is passed and we don't want it in the toutput, then it should be added to the input for the known-conclusion model
         text_inputs = [ '<premises> ' + x + ' </premises>' for x in premises]
     else:
         text_inputs = [ '<conclusion> ' + x[1] + ' </conclusion> ' + ' <premises> ' + x[0] + ' </premises> ' for x in zip(premises, conclusions)]
-            
+    
+
     model_inputs = tokenizer(text_inputs, max_length=max_input_length, truncation=True, padding='max_length')
     
     if isinstance(counters[0], list):
         counters = [' '.join(x) for x in counters]
     
-    
+
     if conclusion_in_output:
         text_outputs = [ '<conclusion> ' + x[0] + ' <counter> ' + x[1]  for x in zip(conclusions, counters)]
     else:
         text_outputs = counters
-        
+
+
     # Setup the tokenizer for targets
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(text_outputs, max_length=max_target_length, truncation=True, padding='max_length')    
@@ -390,7 +387,7 @@ def check_sig(v1s, v2s, alpha=0.05):
     is_normal = stats.shapiro(diff)[1] > alpha
     
     if is_normal:
-        print('Distribution is normal, so using ttest_rel')
+        #print('Distribution is normal, so using ttest_rel')
         ttest = stats.ttest_rel(v1s, v2s)
         if ttest.statistic >=0:
             if (ttest.pvalue/2) <= alpha:
@@ -401,7 +398,7 @@ def check_sig(v1s, v2s, alpha=0.05):
             return False
 
     else:
-        print('Distribution is not normal, so using wilcoxon')
+        #print('Distribution is not normal, so using wilcoxon')
         ttest = stats.wilcoxon(v1s, v2s, alternative='greater')
         
         if ttest.statistic >=0:

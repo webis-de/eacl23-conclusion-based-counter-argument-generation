@@ -18,82 +18,74 @@ from transformers import AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq, Seq2SeqT
 from transformers import BartTokenizer, BartForConditionalGeneration
 
 
-def fine_tune_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, valid_batch_size=4, epochs=3):
+def fine_tune_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, valid_batch_size=4, epochs=1):
 
-    for lr in [2e-5, 3e-5, 5e-5]:
-        for bs in [32]:
-            tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
-            model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
+    for lr in [5e-5, 5e-4, 5e-3]:
+        tokenizer = BartTokenizer.from_pretrained('facebook/bart-large')
+        model = BartForConditionalGeneration.from_pretrained('facebook/bart-large')
 
-            #Add special tokens only if the conclusion in the input
-            if not args.conclusion_and_counter_generation:
-                special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
-                num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-                model.resize_token_embeddings(len(tokenizer))
+        #Add special tokens only if the conclusion in the input
+        if not args.conclusion_and_counter_generation:
+            special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+            num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+            model.resize_token_embeddings(len(tokenizer))
 
-            if args.masked_conclusion:
-                print('Training model with masked conclusion in the input')
-                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-                
-            elif args.conclusion_and_counter_generation:
-                print('Training model to generate conclusion and counter')
-                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-            else:
-                print('Training baseline with known conclusion in the input')
-                training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-                valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
-
-
-            data_collator= DataCollatorForSeq2Seq(tokenizer, model)
-
-            training_args = Seq2SeqTrainingArguments(
-                output_dir + "-model-{}".format(str(lr) + '-' + str(bs)),
-                evaluation_strategy = "steps",
-                logging_dir = args.logging_dir + "-model-{}".format(str(lr) + '-' + str(bs)),
-                eval_steps=500,
-                save_steps=500,
-                learning_rate=lr,
-                per_device_train_batch_size=bs,
-                per_device_eval_batch_size=32,
-                weight_decay=0.01,
-                save_total_limit=5,
-                num_train_epochs=1,
-                load_best_model_at_end=True,
-                predict_with_generate=True,
-                metric_for_best_model='bert-fscore',
-                label_names=['labels', 'conclusion_labels']
-            )
-
-            trainer = Seq2SeqTrainer(
-                model,
-                training_args,
-                train_dataset=training_enc_ds,
-                eval_dataset=valid_enc_ds,
-                data_collator=data_collator,
-                tokenizer=tokenizer,
-                compute_metrics=lambda x : compute_metrics(x, tokenizer)
-            )
+        if args.masked_conclusion:
+            print('Training model with masked conclusion in the input')
+            training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+            valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
             
-            trainer.train()
-            trainer.save_model()
+        elif args.conclusion_and_counter_generation:
+            print('Training model to generate conclusion and counter')
+            training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+            valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        else:
+            print('Training baseline with known conclusion in the input')
+            training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+            valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
 
-def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, valid_batch_size=4, epochs=3):
 
-    max_input_length = 512
-    max_target_length = 200
+        data_collator= DataCollatorForSeq2Seq(tokenizer, model)
+
+        training_args = Seq2SeqTrainingArguments(
+            output_dir + "-model-{}".format(str(lr)),
+            evaluation_strategy = "steps",
+            eval_steps=500,
+            save_steps=500,
+            learning_rate=lr,
+            per_device_train_batch_size=training_batch_size,
+            per_device_eval_batch_size=valid_batch_size,
+            weight_decay=0.01,
+            save_total_limit=5,
+            num_train_epochs=1,
+            load_best_model_at_end=True,
+            predict_with_generate=True,
+            metric_for_best_model='loss',
+        )
+
+        trainer = Seq2SeqTrainer(
+            model,
+            training_args,
+            train_dataset=training_enc_ds,
+            eval_dataset=valid_enc_ds,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            compute_metrics=lambda x : compute_metrics(x, tokenizer)
+        )
+            
+        trainer.train()
+        trainer.save_model()
+
+def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=8, valid_batch_size=8, epochs=1):
 
 
-
-    tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
-    model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')
+    tokenizer = BartTokenizer.from_pretrained('facebook/bart-large')
+    model = BartForConditionalGeneration.from_pretrained('facebook/bart-large')
 
     #Add special tokens only if the conclusion in the input
-    if not args.conclusion_and_counter_generation:
-        special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
-        num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-        model.resize_token_embeddings(len(tokenizer))
+    special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    model.resize_token_embeddings(len(tokenizer))
 
     if args.masked_conclusion:
         print('Training model with masked conclusion in the input')
@@ -110,28 +102,26 @@ def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, val
         valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
 
 
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 
-    training_args = Seq2SeqTrainingArguments(
+    args = Seq2SeqTrainingArguments(
         output_dir,
         evaluation_strategy = "steps",
-        learning_rate=2e-5,
+        eval_steps=500,
+        save_steps=500,
+        learning_rate=5e-5,
         per_device_train_batch_size=training_batch_size,
         per_device_eval_batch_size=valid_batch_size,
         weight_decay=0.01,
         save_total_limit=5,
         num_train_epochs=epochs,
         load_best_model_at_end=True,
-        metric_for_best_model='bert-fscore',
-        predict_with_generate=True
-    )
-
-
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+        predict_with_generate=True)
 
     trainer = Seq2SeqTrainer(
         model,
-        training_args,
-        train_dataset=valid_enc_ds,
+        args,
+        train_dataset=training_enc_ds,
         eval_dataset=valid_enc_ds,
         data_collator=data_collator,
         tokenizer=tokenizer,
@@ -140,6 +130,7 @@ def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=2, val
 
     trainer.train()
     trainer.save_model()
+
 
 #CUDA_VISIABLE_DEVICES=0 python training_conclusion_and_ca_generation.py --train_data ../data/train_conclusion_comp_remove_75sem_perc.pkl --valid_data ../data/valid_conclusion_comp_remove_75sem_perc.pkl --output_dir ../data/output/known-conclusion-bart-model --downsample_valid=0.1 --train_bs=16 --valid_bs=16 --train_epochs=3
 if __name__ == "__main__":
@@ -187,6 +178,10 @@ if __name__ == "__main__":
     parser.add_argument(
         '--counter_clm', type=str, default='counter'
     )
+    parser.add_argument(
+        '--unique_targets', action="store_true"
+    )
+
     parser.add_argument('--max_source_length', type=int, default=512)
     parser.add_argument('--max_target_length', type=int, default=200)
     parser.add_argument('--train_bs', type=int, default=32)
@@ -196,8 +191,12 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    train_ds = Dataset.from_pandas(pd.read_pickle(args.train_data))
-    valid_ds = Dataset.from_pandas(pd.read_pickle(args.valid_data))
+    if args.unique_targets:
+        train_ds = Dataset.from_pandas(pd.read_pickle(args.train_data).drop_duplicates('post_id'))
+        valid_ds = Dataset.from_pandas(pd.read_pickle(args.valid_data).drop_duplicates('post_id'))
+    else:
+        train_ds = Dataset.from_pandas(pd.read_pickle(args.train_data))
+        valid_ds = Dataset.from_pandas(pd.read_pickle(args.valid_data))
 
 
     if args.downsample_training < 1:
