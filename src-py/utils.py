@@ -19,8 +19,13 @@ logger = logging.getLogger(__name__)
 bertscore_metric = load_metric('bertscore')
 bleu_score = load_metric('bleu')
 
-special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<claim>', '<counter>']}
 
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+        
 def pad_input_sequence(sequence, tokenizer, padding_token, max_len=None, truncate=False):
     max_len  = max(len(x) for x in sequence) if max_len is None else max_len
     sequence = [s + [padding_token] * (max_len - len(s)) if len(s) <  max_len else s[:max_len]
@@ -216,19 +221,33 @@ def generate_counters(model, tokenizer, data_loader, gen_kwargs, skip_special_to
     return generated_attacks
 
 
-def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False):
+def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False, batched=False):
     result = {
         'bleu_scores': [],
         'bert-fscores': []
     }
 
-    bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)    
+    if batched:
+        for batch in chunks(list(zip(generated_attacks, gt_attacks)), 100):
+            batch_preds, batch_refs = zip(*batch)
+            bertscore_metric.add_batch(predictions=batch_preds, references=batch_refs)
+    else:
+        bertscore_metric.add_batch(predictions=generated_attacks, references=gt_attacks)
+    
     bertscore_result = bertscore_metric.compute(lang='en', rescale_with_baseline=True)
+    
+    
+    if batched:
+        for batch in chunks(list(zip(generated_attacks, gt_attacks)), 100):
+            batch_preds, batch_refs = zip(*batch)
+            batch_refs  = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in batch_refs]
+            batch_preds = [nltk.word_tokenize(x) for x in batch_preds]
+            bleu_score.add_batch(predictions=batch_preds, references=batch_refs)
+    else:
+        refs  = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
+        preds = [nltk.word_tokenize(x) for x in generated_attacks]
+        bleu_score.add_batch(predictions=preds, references=refs)
 
-    gts = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
-    preds = [nltk.word_tokenize(x) for x in generated_attacks]
-
-    bleu_score.add_batch(predictions=preds, references=gts)    
     bleuscore_result = bleu_score.compute()
 
     result['bert-fscore'] =np.mean(bertscore_result['f1'])
@@ -255,28 +274,37 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False):
         
     return result
 
+    preprocess_function(x, tokenizer, premises_clm, 'counter', conclusion_clm=conclusion_clm)
+
 #Encoding function for premises and conclusion experiments
-def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, conclusion_in_output=False, max_input_length=512, max_target_length=200, conclusion_idx=-1):
+def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusion_clm=None, counter_conclusion_clm=None , conclusion_in_output=False, 
+    conclusion_and_counter_conclusion_in_output=False, max_input_length=512, max_target_length=200, conclusion_idx=-1):
     premises   = examples[premises_clm]
-    conclusions = examples[conclusion_clm] if conclusion_clm != None else None
     counters = examples[counter_clm]
-    
+    conclusions = examples[conclusion_clm] if conclusion_clm != None else None
+    counter_conclusions = examples[counter_conclusion_clm] if counter_conclusion_clm != None else None
         
     if isinstance(premises[0], list):
         premises = [' '.join(x) for x in premises]
     
+    # In case we have multiple conclusions, we will chose the one that 
+    # is indicated in the conclusion_idx
     if conclusions is not None and isinstance(conclusions[0], list):
         if conclusion_idx != -1:
-            conclusions = ['' if conclusion_idx > len(x)-1 else x[conclusion_idx] for x in conclusions] #just counter an empty conclusion if we don't have anymore conclusions at that required index....
+            #just counter an empty conclusion if we don't have anymore conclusions at that required index....
+            conclusions = ['' if conclusion_idx > len(x)-1 else x[conclusion_idx] for x in conclusions]
+            print(conclusions[:3])
         else:
             conclusions = [' '.join(x) for x in conclusions]
 
-    if conclusions == None or conclusion_in_output== True: #if conclusion is passed and we don't want it in the toutput, then it should be added to the input for the known-conclusion model
+    # If conclusion is passed and we don't want it in the output, 
+    # then it should be added to the input for the known-conclusion model
+    if conclusions == None or conclusion_in_output== True or conclusion_and_counter_conclusion_in_output==True: 
         text_inputs = [ '<premises> ' + x + ' </premises>' for x in premises]
     else:
         text_inputs = [ '<conclusion> ' + x[1] + ' </conclusion> ' + ' <premises> ' + x[0] + ' </premises> ' for x in zip(premises, conclusions)]
     
-
+    
     model_inputs = tokenizer(text_inputs, max_length=max_input_length, truncation=True, padding='max_length')
     
     if isinstance(counters[0], list):
@@ -284,7 +312,9 @@ def preprocess_function(examples, tokenizer, premises_clm, counter_clm, conclusi
     
 
     if conclusion_in_output:
-        text_outputs = [ '<conclusion> ' + x[0] + ' <counter> ' + x[1]  for x in zip(conclusions, counters)]
+        text_outputs = [ '<conclusion> ' + x[0] + ' <counter> ' + x[1] for x in zip(conclusions, counters)]
+    elif conclusion_and_counter_conclusion_in_output:
+        text_outputs = [ '<conclusion> ' + x[0] + ' <claim> ' + x[1] + ' <counter> ' + x[2] for x in zip(conclusions, counter_conclusions, counters)]        
     else:
         text_outputs = counters
 

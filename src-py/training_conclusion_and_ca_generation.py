@@ -26,7 +26,7 @@ def fine_tune_model(train_ds, valid_ds, output_dir, args, training_batch_size=2,
 
         #Add special tokens only if the conclusion in the input
         if not args.conclusion_and_counter_generation:
-            special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+            special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<claim>', '<counter>']}
             num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
             model.resize_token_embeddings(len(tokenizer))
 
@@ -83,7 +83,7 @@ def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=8, val
     model = BartForConditionalGeneration.from_pretrained('facebook/bart-large')
 
     #Add special tokens only if the conclusion in the input
-    special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<counter>']}
+    special_tokens_dict = {'additional_special_tokens': ['<conclusion>', '</conclusion>','<premises>', '</premises>', '<claim>', '<counter>']}
     num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
 
@@ -96,6 +96,10 @@ def train_model(train_ds, valid_ds, output_dir, args, training_batch_size=8, val
         print('Training model to generate conclusion and counter')
         training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
         valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+    elif args.conclusion_and_counter_conclusion_in_generation:
+        print('Training model to generate conclusion, counter_conclusion, and counter')
+        training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, counter_conclusion_clm=args.counter_conclusion_clm, conclusion_in_output=False, conclusion_and_counter_conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
+        valid_enc_ds = valid_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, counter_conclusion_clm=args.counter_conclusion_clm, conclusion_in_output=False, conclusion_and_counter_conclusion_in_output=True, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
     else:
         print('Training baseline with known conclusion in the input')
         training_enc_ds = train_ds.map(lambda x :preprocess_function(x, tokenizer, args.premises_clm, args.counter_clm, conclusion_clm=args.conclusion_clm, max_target_length=args.max_target_length, max_input_length=args.max_source_length), batched=True)
@@ -146,6 +150,10 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
+        '--conclusion_and_counter_conclusion_in_generation', action="store_true"
+    )
+
+    parser.add_argument(
         '--train_data', type=str
     )
     
@@ -177,6 +185,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--counter_clm', type=str, default='counter'
+    )
+    parser.add_argument(
+        '--counter_conclusion_clm', type=str, default=None
     )
     parser.add_argument(
         '--unique_targets', action="store_true"

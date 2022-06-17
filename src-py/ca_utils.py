@@ -2,6 +2,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoModelForSequenceClassificati
 from datasets import load_dataset, load_metric, Dataset
 import torch
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 tqdm.pandas()
 
@@ -19,9 +20,9 @@ import torch
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-###### Loading stance classifier ##############
-conclusion_gen_tokenizer = AutoTokenizer.from_pretrained("../../../data-ceph/arguana/arg-generation/conclusion-generation-models/dbart")
-conclusion_gen_model = AutoModelForSeq2SeqLM.from_pretrained("../../../data-ceph/arguana/arg-generation/conclusion-generation-models/dbart").to(device)
+###### Loading conclusion generation model ##############
+conclusion_gen_tokenizer = AutoTokenizer.from_pretrained("../data/output/conc-gen-model/")
+conclusion_gen_model = AutoModelForSeq2SeqLM.from_pretrained("../data/output/conc-gen-model/").to(device)
 
 ###### Loading the stance-classification model #########
 stance_class_tokenizer = AutoTokenizer.from_pretrained('roberta-base')
@@ -35,7 +36,6 @@ arg_quality_pipeline = TextClassificationPipeline(model=gretz_model, tokenizer=g
 
 ###### Loading claim target identifier ############   
 target_identifier_model = SequenceTagger.load('../../../data-ceph/arguana/arg-generation/claim-target-tagger/model/final-model.pt')
-
 
 def extract_targets(claims):
     sentences = [Sentence(x) for x in claims]
@@ -60,6 +60,7 @@ def get_arg_quality(sents):
 def get_stance_scores(sents1, sents2):
     #compute stance score using our trained model
     text_inputs = [x[0] + ' </s> ' + x[1] for x in zip(sents1, sents2)]
+    #print(text_inputs)
     stance_results = arg_stance_pipeline(text_inputs, truncation=True)
     stance_labels = [int(x['label'].split('_')[-1]) for x in stance_results]
     stance_scores = [x['score'] for x in stance_results]
@@ -78,7 +79,7 @@ def generate_conclusion(premises, gen_kwargs, batch_size=16):
 
     conclusion_gen_model.eval()
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
 
