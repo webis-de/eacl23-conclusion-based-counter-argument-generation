@@ -244,7 +244,22 @@ def evaluate_gen_attacks(generated_attacks, gt_attacks, detailed=False, batched=
             batch_preds = [nltk.word_tokenize(x) for x in batch_preds]
             bleu_score.add_batch(predictions=batch_preds, references=batch_refs)
     else:
-        refs  = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
+        refs = [[nltk.word_tokenize(refs)] if type(refs) != list else [nltk.word_tokenize(ref) for ref in refs] for refs in gt_attacks]
+        
+#         refs=[]
+#         for gt_attack in gt_attacks:
+#             if type(gt_attack) != list:
+#                 refs.append([nltk.word_tokenize(gt_attack)])
+#             else:
+#                 x = []
+#                 for ref in gt_attack:
+#                     print(ref)
+#                     print('------------')
+#                     x.append(nltk.word_tokenize(ref))
+
+#                 refs.append(x)
+                 
+                        
         preds = [nltk.word_tokenize(x) for x in generated_attacks]
         bleu_score.add_batch(predictions=preds, references=refs)
 

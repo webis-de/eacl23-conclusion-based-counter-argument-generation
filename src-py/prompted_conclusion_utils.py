@@ -14,9 +14,6 @@ tqdm.pandas()
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 print(device)
 
-tokenizer = AutoTokenizer.from_pretrained("../data/output/conc-gen-model/")
-model = AutoModelForSeq2SeqLM.from_pretrained("../data/output/conc-gen-model/").to(device)
-
 def get_wiki_concepts(posts, min_len=1, max_concepts=3):
     post_concepts = []
     for post in posts:
@@ -66,10 +63,10 @@ def allowed_prefix(prefixs, tokenizer, batch_id, sent):
     
     remained_tokens = [x for x in encoded_pref if x not in gen_tokens]
     
-    #print(gen_tokens)
-    #print(decoded_sent)
-    #print(encoded_pref)
-    #print('remained:', remained_tokens)
+    # print(gen_tokens)
+    # print(decoded_sent)
+    # print(encoded_pref)
+    # print('remained:', remained_tokens)
     
     if len(remained_tokens) > 0: #just control the first token
         return [remained_tokens[0]]
@@ -77,7 +74,7 @@ def allowed_prefix(prefixs, tokenizer, batch_id, sent):
         None
         
 
-def generate_prompted_conclusions(premises, prefixes, gen_kwargs, batch_size=16):
+def generate_prompted_conclusions(model, tokenizer, premises, prefixes, gen_kwargs, batch_size=16):
 
     if type(premises[0]) == list:
         premises = [' '.join(x) for x in premises]
@@ -159,3 +156,52 @@ def generate_prompted_counters(model, tokenizer, premises, prefixes, gen_kwargs,
             generated_counters += decoded_preds
 
     return generated_counters
+
+def generate_two_seq_prompted_counters(model, tokenizer, premises, prefixes, conclusion_gen_kwargs, argument_gen_kwargs, batch_size=16):
+
+    if type(premises[0]) == list:
+        premises = [' '.join(x) for x in premises]
+    
+    ds = Dataset.from_dict({'premises': premises, 'prefixes': prefixes})
+    ds = ds.map(lambda x :tokenizer(x['premises'], max_length=512, truncation=True, padding='max_length') , batched=True)
+    ds.set_format(type='torch', columns=['input_ids', 'attention_mask'], output_all_columns=True)
+    dataloader = torch.utils.data.DataLoader(ds, batch_size=batch_size)
+
+    generated_counter_arguments = []
+    generated_conclusions = []
+    
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            batch_prefixs = batch['prefixes']
+
+            processors1 = LogitsProcessorList()
+            processors1.append(PrefixConstrainedLogitsProcessor(
+                lambda batch_id, sent: allowed_prefix(batch_prefixs, tokenizer, batch_id, sent), conclusion_gen_kwargs['num_beams']))
+    
+        
+            processors2 = LogitsProcessorList()
+            processors2.append(PrefixConstrainedLogitsProcessor(
+                lambda batch_id, sent: allowed_prefix(batch_prefixs, tokenizer, batch_id, sent), argument_gen_kwargs['num_beams']))
+            
+            generated_conclusion_tokens = model.generate_conclusion(input_ids, attention_mask, conclusion_gen_kwargs, processors1) 
+            generated_argument_tokens   = model.generate_counter_argument(input_ids, attention_mask, argument_gen_kwargs, processors2)
+            
+            if isinstance(generated_conclusion_tokens, tuple):
+                generated_conclusion_tokens = generated_conclusion_tokens[0]
+                
+            if isinstance(generated_argument_tokens, tuple):
+                generated_argument_tokens = generated_argument_tokens[0]
+            
+            generated_argument_tokens = generated_argument_tokens.cpu().numpy()
+            decoded_arguments = tokenizer.batch_decode(generated_argument_tokens, skip_special_tokens=True)
+            
+            generated_conclusion_tokens = generated_conclusion_tokens.cpu().numpy()
+            decoded_conclusions = tokenizer.batch_decode(generated_conclusion_tokens, skip_special_tokens=True)
+            
+            generated_counter_arguments +=decoded_arguments
+            generated_conclusions +=decoded_conclusions
+
+    return generated_conclusions, generated_counter_arguments

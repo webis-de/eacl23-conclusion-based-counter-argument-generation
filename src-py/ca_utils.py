@@ -30,12 +30,12 @@ stance_class_model = AutoModelForSequenceClassification.from_pretrained('../data
 arg_stance_pipeline = TextClassificationPipeline(model=stance_class_model, tokenizer=stance_class_tokenizer, framework='pt', task='ArgQ', device=0)
 
 ####### Loading the argument quality pipeline ###########
-gretz_model = BertForSequenceClassification.from_pretrained('../../../data-ceph/arguana/arg-generation/argument-quality/argument-quality-model/checkpoint-9000', local_files_only=True, cache_dir='cache')
+gretz_model = BertForSequenceClassification.from_pretrained('../../data-ceph/arguana/arg-generation/argument-quality/argument-quality-model/checkpoint-9000', local_files_only=True, cache_dir='cache')
 gretz_tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased', cache_dir='cache')
 arg_quality_pipeline = TextClassificationPipeline(model=gretz_model, tokenizer=gretz_tokenizer, framework='pt', task='ArgQ', device=0)
 
 ###### Loading claim target identifier ############   
-target_identifier_model = SequenceTagger.load('../../../data-ceph/arguana/arg-generation/claim-target-tagger/model/final-model.pt')
+target_identifier_model = SequenceTagger.load('../../data-ceph/arguana/arg-generation/claim-target-tagger/model/final-model.pt')
 
 def extract_targets(claims):
     sentences = [Sentence(x) for x in claims]
