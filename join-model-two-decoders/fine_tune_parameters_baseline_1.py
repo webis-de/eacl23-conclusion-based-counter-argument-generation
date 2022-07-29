@@ -38,10 +38,8 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 print("Using GPU? ", torch.cuda.is_available())
 print("Device name:", torch.cuda.get_device_name(0))
 
-
 data_dir = '../../data-ceph/arguana/arg-generation/multi-taks-counter-argument-generation/reddit_data/conclusion_and_ca_generation/'
 teacher_model_path='../data/output/stance_classification/best_model/'
-
 
 #Teacher model
 stance_classifier_teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_path)
@@ -66,18 +64,17 @@ def main(args):
     dev_loader= DataLoader(dev_dataset, shuffle=False, batch_size=args.valid_batch_size)
     #test_loader= DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
     
-    for alpha1 in [0.3, 0.6, 0.9]:
-        for alpha2 in [0.3, 0.6, 0.9]:
-            print('Training with alph1={} and alph2={}'.format(alpha1, alpha2))
-            #Our model
-            model = OurModel.create(model_name='facebook/bart-large', 
-                                    model_config=transformers.AutoConfig.from_pretrained('facebook/bart-large'))
-            tokenizer = transformers.AutoTokenizer.from_pretrained('facebook/bart-large')
+    for alpha1 in [0.1, 0.3, 0.5, 0.7]:
+        print('Training with alph1={} and alph2={}'.format(alpha1, 1-alpha1))
+        #Our model
+        model = OurModel.create(model_name='facebook/bart-large', 
+                                model_config=transformers.AutoConfig.from_pretrained('facebook/bart-large'))
+        tokenizer = transformers.AutoTokenizer.from_pretrained('facebook/bart-large')
 
-            model.to(device)
-            model.train()
+        model.to(device)
+        model.train()
 
-            run_training(args, model, tokenizer, train_loader, dev_loader, alpha1, alpha2)
+        run_training(args, model, tokenizer, train_loader, dev_loader, alpha1, 1-alpha1)
 
     
           
@@ -128,48 +125,24 @@ def run_training(args, model, tokenizer, train_loader, dev_loader, alpha1, alpha
             #1. Running through the conclusion decoder
             conclusion_outputs = model.conclusion_model(input_ids, attention_mask=attention_mask, labels = conclusion_targets, return_dict=True)
 
-
             #8. Running through the counter-argument decoder
             counter_argument_outputs = model.counter_argument_model(input_ids, attention_mask=attention_mask, labels = argument_targets, return_dict=True)
-            counter_argument_lhs    = counter_argument_outputs.encoder_last_hidden_state # this is actually decoder's last hidden state, look at model.py for details
-            eos_mask = argument_targets.eq(model.counter_argument_model.config.eos_token_id)
-            counter_argument_sentence_embedding = counter_argument_lhs[eos_mask, :].view(counter_argument_lhs.size(0), -1, counter_argument_lhs.size(-1))[:, -1, :]
-
-            #9. Compute the stance between the generated counter-argument and the input conclusion
-            outputs_reference = model.counter_argument_model(**batch_conclusion_encoding, return_dict=True)
-            reference_last_hidden_state = outputs_reference.encoder_last_hidden_state #decoder's last hidden state
-            refernce_sentence_embedding = reference_last_hidden_state[:,-1,:]
-            concat_embedding_stance = torch.cat((counter_argument_sentence_embedding, refernce_sentence_embedding), 1)
-            approx_logits_classification = model.counter_argument_model.classification_head(concat_embedding_stance)
-            approx_logits_classification = torch.sigmoid(approx_logits_classification)
-
-            #10. Compute the real stance between the generated counter-argument and the input conclusion through the teacher model
-            generated_counter_argument = model.counter_argument_model.generate(input_ids, max_length=args.max_argument_target)
-            generated_counter_argument = tokenizer.batch_decode(generated_counter_argument, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            jointTxt_stance = [a + " </s> " + b  for a,b, in zip(generated_counter_argument, batch_conclusions)] # for ms
-            jointTxt_stance = stance_classifier_teacher_tokenizer.batch_encode_plus(jointTxt_stance, return_tensors="pt", max_length=args.max_argument_target + args.max_claim_target, truncation=True, padding=True)
-            jointTxt_stance = jointTxt_stance.to(device)
-            real_logits_classification = stance_classifier_teacher_model(**jointTxt_stance)[0]
-            real_logits_classification = torch.sigmoid(real_logits_classification).to(device)
-            
-            #11. Compute the counter-argument stance loss 
-            loss_fct = MSELoss()
-            counter_argument_stance_loss = loss_fct(approx_logits_classification, real_logits_classification)
 
             avg_loss_claim_gen.append(0)
             avg_loss_argument_gen.append(float(counter_argument_outputs.loss))
             avg_loss_conc_gen.append(float(conclusion_outputs.loss))
             avg_loss_claim_to_conclusion_stance.append(0)
-            avg_loss_argument_to_conclusion_stance.append(float(counter_argument_stance_loss))
+            avg_loss_argument_to_conclusion_stance.append(float(0))
             avg_loss_argument_to_claim_stance.append(0)
             avg_loss_conclusion_stance.append(float(0))
 
-            loss = counter_argument_outputs.loss + alpha1 * conclusion_outputs.loss + alpha2 * counter_argument_stance_loss
+            loss = alpha1 * conclusion_outputs.loss + alpha2 * counter_argument_outputs.loss
             
             loss.backward()
             optim.step()
             num_global_steps+=1
             i+=1
+
 
 
             if num_global_steps % args.eval_steps == 0:
@@ -184,9 +157,7 @@ def run_training(args, model, tokenizer, train_loader, dev_loader, alpha1, alpha
                     file.write("Parameters: {}, {} ".format(alpha1, alpha2))
                     file.write("Epoch " + str(epoch) + " Step " + str(num_global_steps))
                     file.write('\n')
-                    file.writelines(['Source: ', tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True, clean_up_tokenization_spaces=False), '\n\n', 
-                                     'Argument Target: ', generated_counter_argument[0], '\n\n',
-                                     'Validation losses: {}, {}, {}, {}, {}, {}, {}, {}'.format(avg_eval_loss, eval_loss_claim_gen, eval_loss_argument_gen, eval_loss_conc_gen, eval_loss_claim_to_conclusion_stance, eval_loss_argument_to_conclusion_stance, eval_loss_argument_to_claim_stance, eval_loss_conclusion_stance), '\n\n\n'])
+                    file.writelines(['Validation losses: {}, {}, {}, {}, {}, {}, {}, {}'.format(avg_eval_loss, eval_loss_claim_gen, eval_loss_argument_gen, eval_loss_conc_gen, eval_loss_claim_to_conclusion_stance, eval_loss_argument_to_conclusion_stance, eval_loss_argument_to_claim_stance, eval_loss_conclusion_stance), '\n\n\n'])
 
                 
                 path_model = models_path_prefix + "/models-global-step-" + str(num_global_steps) + "-" + "{}-{}".format(alpha1, alpha2)
@@ -223,39 +194,14 @@ def run_evaluation(args, model, tokenizer, dev_loader):
             #1. Running through the conclusion decoder
             conclusion_outputs = model.conclusion_model(input_ids, attention_mask=attention_mask, labels = conclusion_targets, return_dict=True)
 
-
             #8. Running through the counter-argument decoder
             counter_argument_outputs = model.counter_argument_model(input_ids, attention_mask=attention_mask, labels = argument_targets, return_dict=True)
-            counter_argument_lhs    = counter_argument_outputs.encoder_last_hidden_state # this is actually decoder's last hidden state, look at model.py for details
-            eos_mask = argument_targets.eq(model.counter_argument_model.config.eos_token_id)
-            counter_argument_sentence_embedding = counter_argument_lhs[eos_mask, :].view(counter_argument_lhs.size(0), -1, counter_argument_lhs.size(-1))[:, -1, :]
-
-            #9. Compute the stance between the generated counter-argument and the input conclusion
-            outputs_reference = model.counter_argument_model(**batch_conclusion_encoding, return_dict=True)
-            reference_last_hidden_state = outputs_reference.encoder_last_hidden_state #decoder's last hidden state
-            refernce_sentence_embedding = reference_last_hidden_state[:,-1,:]
-            concat_embedding_stance = torch.cat((counter_argument_sentence_embedding, refernce_sentence_embedding), 1)
-            approx_logits_classification = model.counter_argument_model.classification_head(concat_embedding_stance)
-            approx_logits_classification = torch.sigmoid(approx_logits_classification)
-
-            #10. Compute the real stance between the generated counter-argument and the input conclusion through the teacher model
-            generated_counter_argument = model.counter_argument_model.generate(input_ids, max_length=args.max_argument_target)
-            generated_counter_argument = tokenizer.batch_decode(generated_counter_argument, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            jointTxt_stance = [a + " </s> " + b  for a,b, in zip(generated_counter_argument, batch_conclusions)] # for ms
-            jointTxt_stance = stance_classifier_teacher_tokenizer.batch_encode_plus(jointTxt_stance, return_tensors="pt", max_length=args.max_argument_target + args.max_claim_target, truncation=True, padding=True)
-            jointTxt_stance = jointTxt_stance.to(device)
-            real_logits_classification = stance_classifier_teacher_model(**jointTxt_stance)[0]
-            real_logits_classification = torch.sigmoid(real_logits_classification).to(device)
-            
-            #11. Compute the counter-argument stance loss 
-            loss_fct = MSELoss()
-            counter_argument_stance_loss = loss_fct(approx_logits_classification, real_logits_classification)
 
             avg_loss_claim_gen.append(0)
             avg_loss_argument_gen.append(float(counter_argument_outputs.loss))
             avg_loss_conc_gen.append(float(conclusion_outputs.loss))
             avg_loss_claim_to_conclusion_stance.append(0)
-            avg_loss_argument_to_conclusion_stance.append(float(counter_argument_stance_loss))
+            avg_loss_argument_to_conclusion_stance.append(float(0))
             avg_loss_argument_to_claim_stance.append(0)
             avg_loss_conclusion_stance.append(float(0))
 

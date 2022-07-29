@@ -40,7 +40,7 @@ print("Device name:", torch.cuda.get_device_name(0))
 
 
 data_dir = '../../data-ceph/arguana/arg-generation/multi-taks-counter-argument-generation/reddit_data/conclusion_and_ca_generation/'
-teacher_model_path='../multitask-counter-arg-generation/data/output/stance_classification/best_model/'
+teacher_model_path='../data/output/stance_classification/best_model/'
 
 
 #Teacher model
@@ -65,9 +65,8 @@ def main(args):
     # TODO: use arg input
         
    
-    alpha1 = 1
-    alpha2 = 0.6
-    alpha3 = 0.9
+    alpha1 = 0.7
+    alpha2 = 0.3
     
     
     # NOTE: NEED to write own data loading function
@@ -135,7 +134,7 @@ def main(args):
             avg_loss_argument_to_claim_stance.append(0)
             avg_loss_conclusion_stance.append(float(0))
 
-            loss = conclusion_outputs.loss + alpha2 * counter_argument_outputs.loss
+            loss = alpha1 * conclusion_outputs.loss + alpha2 * counter_argument_outputs.loss
             
             loss.backward()
             optim.step()
