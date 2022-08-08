@@ -1,4 +1,5 @@
-fastai==2.5.3
-spacy==2.2.1
-fast-pagerank
-sentence-transformers
+torch==1.11.0+cu113
+flair==0.11
+spacy==3.3.1
+tensorflow-gpu==2.7.0
+transformers==4.18.0
