@@ -4,6 +4,8 @@
 
 The code in src-ipynb/data_prep.ipynb contains data preparation for the training split including removing the pot comments, and selecting for each post one comment that has the highest argumentative score according to the work of Gretz et al 2019.
 
+**Note**: The full data can't fit in the zip file. Instead we provided a data sample in ``sample-data`` folder.
+
 ## Training:
 
 ### Training the basline:
