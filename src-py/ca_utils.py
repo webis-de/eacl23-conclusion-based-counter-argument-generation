@@ -21,12 +21,12 @@ import torch
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 ###### Loading conclusion generation model ##############
-conclusion_gen_tokenizer = AutoTokenizer.from_pretrained("../data/output/conc-gen-model/")
-conclusion_gen_model = AutoModelForSeq2SeqLM.from_pretrained("../data/output/conc-gen-model/").to(device)
+conclusion_gen_tokenizer = AutoTokenizer.from_pretrained("../sample-data/output/conc-gen-model/")
+conclusion_gen_model = AutoModelForSeq2SeqLM.from_pretrained("../sample-data/output/conc-gen-model/").to(device)
 
 ###### Loading the stance-classification model #########
 stance_class_tokenizer = AutoTokenizer.from_pretrained('roberta-base')
-stance_class_model = AutoModelForSequenceClassification.from_pretrained('../data/output/stance_classification/best_model').cuda()
+stance_class_model = AutoModelForSequenceClassification.from_pretrained('../sample-data/stance_classification/best_model').cuda()
 arg_stance_pipeline = TextClassificationPipeline(model=stance_class_model, tokenizer=stance_class_tokenizer, framework='pt', task='ArgQ', device=0)
 
 ####### Loading the argument quality pipeline ###########
