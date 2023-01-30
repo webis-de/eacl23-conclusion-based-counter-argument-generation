@@ -1,5 +1,5 @@
 torch==1.11.0+cu113
 flair==0.11
 spacy==3.3.1
-tensorflow-gpu==2.7.0
+tensorflow-gpu==2.9.3
 transformers==4.18.0
